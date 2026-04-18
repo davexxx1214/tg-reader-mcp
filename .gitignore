@@ -56,7 +56,3 @@ analysis_pipeline_latest.json
 *.db
 *.sqlite
 *.sqlite3
-
-# Trading data (runtime generated)
-skills/alpaca-live-trading/data/*
-!skills/alpaca-live-trading/data/.gitignore
