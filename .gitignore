@@ -37,6 +37,7 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 
@@ -44,3 +45,18 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Project secrets & runtime data
+config.yaml
+balance.jsonl
+position.jsonl
+analysis_pipeline_latest.json
+
+# SQLite databases (runtime generated)
+*.db
+*.sqlite
+*.sqlite3
+
+# Trading data (runtime generated)
+skills/alpaca-live-trading/data/*
+!skills/alpaca-live-trading/data/.gitignore

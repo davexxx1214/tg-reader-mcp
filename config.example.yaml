@@ -1,0 +1,83 @@
+# TG Reader MCP + Alpaca Live Trading - 配置模板
+# 复制此文件为 config.yaml 并填入真实的 API Key
+#   cp config.example.yaml config.yaml
+
+# ═══════════════════════════════════════════════
+# Telegram API 凭证（MCP 登录必填）
+# 申请地址: https://my.telegram.org/apps
+# ═══════════════════════════════════════════════
+telegram_api:
+  api_id: 0
+  api_hash: "your_telegram_api_hash"
+
+# ═══════════════════════════════════════════════
+# 以下为 Alpaca Trading Skill 配置（交易功能需要）
+# ═══════════════════════════════════════════════
+
+# AlphaVantage API - 用于获取股价数据和市场新闻
+# 申请地址: https://www.alphavantage.co/support/#api-key
+alphavantage:
+  api_key: "your_alphavantage_api_key"
+
+# Alpaca Trading API - 用于查询账户和执行交易
+# 申请地址: https://app.alpaca.markets/paper/dashboard/overview
+# paper: true 表示模拟交易，false 表示真实交易
+alpaca:
+  api_key: "your_alpaca_api_key"
+  secret_key: "your_alpaca_secret_key"
+  paper: true
+
+# Polymarket - 不需要 API Key（公开 API）
+
+# 策略执行配置（自动生成交易计划）
+strategy:
+  enabled: true
+  # 单策略模式：优先读取 name
+  name: w_bottom_breakout
+  # To use the trend strategy validated in the autoresearch repo, switch to:
+  # name: autoresearch_trend
+  # 兼容旧版多策略（未设置 name 时使用 names[0]）
+  names:
+    - news_momentum
+    - market_gate_trend
+  # 信号置信度阈值（0-1）
+  min_confidence: 0.6
+  # 第一轮策略预筛选保留数量
+  prefilter_top_k: 10
+
+# 市场门控配置
+market_gate:
+  # 用于市场环境判定的 benchmark tickers
+  benchmark_tickers:
+    - QQQ
+    - SPY
+  # 综合门控阈值，低于该值则阻止执行交易
+  threshold: -0.05
+
+# Telegram 新闻源配置（需配合 --tg-news 参数启用）
+telegram:
+  enabled: true
+  # Telethon session 文件路径（绝对路径，指向 tg_session.session）
+  session_path: ""
+  # 采集频道列表
+  channels:
+    - name: "jinshishuju_bot"
+      type: "dm"
+      limit: 50
+  # 中文关键词 → ticker 映射文件路径（相对于 scripts/）
+  ticker_map: "scripts/tg_ticker_map.yaml"
+  # 情绪打分模式: "keyword"（关键词词典）或 "llm"（LLM API，暂未实现）
+  sentiment_mode: "keyword"
+  # TG 文章情绪分权重系数（0-1，略低于 AV 因为关键词打分精度有限）
+  tg_weight: 0.8
+  # 每个 ticker 最多保留的 TG 消息条数
+  max_articles_per_ticker: 50
+
+# 基础风控配置
+risk:
+  # 单只标的最大仓位占账户现金比例（0-1）
+  max_position_pct: 0.1
+  # 最大持仓标的数
+  max_positions: 5
+  # 单笔交易最大金额（美元）
+  max_trade_notional: 2000

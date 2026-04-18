@@ -41,26 +41,40 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
-### 2. Log in once
+### 2. Get a Telegram session file
 
-You need a Telethon `.session` file. The simplest way: run Telethon interactively once.
+You need a Telethon `.session` file. Two options:
 
-```python
-# login.py
-from telethon import TelegramClient
-client = TelegramClient('tg_session', 94575, 'a3406de8d171bb422bb6ddf3bbd800e2')
-client.start()
-print("Logged in. tg_session.session created.")
+**Option A: Copy from another machine (recommended — no interactive login needed)**
+
+If you already have `tg_session.session` from a previous setup, just copy it in:
+
+```bash
+scp tg_session.session user@host:/path/to/tg-reader-mcp/
+chmod 600 tg_session.session
 ```
+
+**Option B: Run the interactive login**
+
+First, copy the config template and fill in your Telegram API credentials:
+
+```bash
+cp config.example.yaml config.yaml
+# Edit config.yaml — fill in telegram_api.api_id and telegram_api.api_hash
+# Get yours at https://my.telegram.org/apps
+```
+
+Then run the login script:
 
 ```bash
 python login.py
 # Enter your phone, the code Telegram sends you, and 2FA if enabled.
+chmod 600 tg_session.session
 ```
 
-This creates `tg_session.session` in the current directory.
-
-> The default `API_ID` / `API_HASH` above are Telegram Desktop's public credentials — safe to use. If you want your own (to raise rate limits or separate audit trails), get them at [my.telegram.org](https://my.telegram.org) and set `TG_API_ID` / `TG_API_HASH` env vars.
+> The `.session` file is your login credential — treat it like a password. It's already in `.gitignore`. When deploying to a new machine, copy it manually.
+>
+> The default `API_ID` / `API_HASH` in `server.py` are Telegram Desktop's public credentials — safe to use for the MCP server itself. `login.py` reads from `config.yaml` so you can use your own (to raise rate limits or separate audit trails). Get them at [my.telegram.org](https://my.telegram.org).
 
 ### 3. Wire into Claude Code
 
@@ -114,6 +128,164 @@ Telegram ToS: [telegram.org/tos](https://telegram.org/tos) · API ToS: [core.tel
 ## Real-world example channel
 
 Follow [@runesgangalpha](https://t.me/runesgangalpha) — my public channel where I use this exact MCP to read and digest Polymarket, AI, and crypto signals. It's a live demo of the workflow.
+
+## Integration: alpaca-live-trading skill
+
+This MCP is designed to work as a **signal source** for the [alpaca-live-trading](https://github.com/runesleo/alpaca-live-trading) system. The typical flow: read financial news from Telegram channels (e.g. 金十bot, alpha signal groups) via `tg-reader-mcp`, feed them into the trading pipeline for sentiment analysis and trade decisions.
+
+### Architecture
+
+```
+Telegram Channels          tg-reader-mcp (MCP)         alpaca-live-trading
+┌──────────────┐          ┌──────────────────┐         ┌──────────────────┐
+│ 金十bot       │─────────▶│ list_dialogs     │         │ Stage 1: Prefilter│
+│ Alpha groups  │          │ read_channel     │────────▶│ Stage 2: Analysis │
+│ Crypto feeds  │          │ search_channel   │         │ Trade Execution   │
+└──────────────┘          │ mark_read        │         └──────────────────┘
+                          └──────────────────┘
+```
+
+### Data pipeline
+
+The alpaca-live-trading skill runs a two-stage analysis pipeline:
+
+**Stage 1 — Prefilter**: Screen candidates using technical strategies (e.g. `w_bottom_breakout`, `autoresearch_trend`). Data sources: local SQLite (daily prices + fundamentals).
+
+**Stage 2 — Deep analysis**: For each candidate + benchmark ETFs (QQQ, SPY), collect:
+- AlphaVantage news sentiment + fundamentals (OVERVIEW / INCOME_STATEMENT / BALANCE_SHEET / CASH_FLOW)
+- Alpaca quotes + SQLite technical indicators
+- Polymarket odds for market gating
+- **Telegram channel signals** via this MCP — search for ticker mentions, read breaking news, gauge sentiment from financial news bots
+
+### Supported Telegram signal sources
+
+| Channel | Username | Use case |
+|---------|----------|----------|
+| 金十bot | `@jinshishuju_bot` | Real-time financial news (geopolitics, macro, commodities) |
+| Custom alpha channels | varies | Ticker-specific signal research via `search_channel` |
+
+### Example workflow: news-driven trading signal
+
+```
+1. Agent calls list_dialogs(filter="unread_dm") → finds 11 unread from 金十bot
+2. Agent calls read_channel(channel="jinshishuju_bot", limit=50) → gets latest news
+3. Agent extracts: "伊拉克恢复南部石油出口" → bullish oil signal
+4. alpaca-live-trading pipeline cross-references with:
+   - AlphaVantage fundamentals for oil sector stocks
+   - Polymarket odds on Iran/Middle East resolution
+   - Technical indicators from local SQLite
+5. Pipeline generates trade plan → risk guard validates → execute (if --execute-trades)
+6. Agent calls mark_read(channel="jinshishuju_bot") → clears unread queue
+```
+
+### alpaca-live-trading data infrastructure
+
+The trading system maintains local SQLite databases with the following schema:
+
+**Daily prices** (`data/stock_daily.sqlite`):
+- `stock_daily` — OHLCV with `PRIMARY KEY (symbol, trade_date)`
+- Sync strategy: first run `outputsize=full`, subsequent `outputsize=compact`, fallback to full
+
+**Fundamentals** (5-year quarterly window):
+- `fundamentals_quarterly` — revenue, operating_income, net_income, cashflows, balance sheet
+- `fundamentals_overview_daily` — market_cap, PE, margins, ROE/ROA, short interest
+
+**Sync scripts**:
+
+```bash
+# Daily prices (single / batch / default pool)
+python scripts/sync_alpha_daily_to_sqlite.py --symbol AAPL
+python scripts/sync_alpha_daily_to_sqlite.py --symbols AAPL,MSFT,NVDA --max-calls-per-minute 75
+
+# Fundamentals
+python scripts/sync_alpha_fundamentals_to_sqlite.py --symbol AAPL --years 5
+python scripts/sync_alpha_fundamentals_to_sqlite.py --default-pool --years 5 --batch-size 20
+
+# Query
+python scripts/query_fundamentals_sqlite.py --symbol BABA --quarters 8
+python scripts/query_prices_sqlite.py --symbols AAPL,NVDA --days 60
+```
+
+### Running the pipeline
+
+```bash
+# Analysis only (no orders)
+python scripts/run_analysis_trade_pipeline.py
+
+# Analysis + auto-execute (with market gate + risk guard)
+python scripts/run_analysis_trade_pipeline.py --execute-trades
+```
+
+Config in `config.yaml`:
+
+```yaml
+strategy:
+  enabled: true
+  name: w_bottom_breakout
+  min_confidence: 0.6
+  prefilter_top_k: 10
+
+market_gate:
+  benchmark_tickers: [QQQ, SPY]
+  threshold: -0.05
+```
+
+### Trade decision logic
+
+1. **Round 2 scoring**: `fundamental_score` (50%) + `technical_score` (30%) + `news_score` (20%, with recency decay)
+2. **Pass rule**: keep candidates with `score >= 0.4`, fallback to top-k if none qualify
+3. **Confidence fusion**: `0.7 × stage1_confidence + 0.3 × round2_score`
+4. **Order sizing**: `qty = floor(min(cash × max_position_pct, max_trade_notional) / price)`
+5. **Risk guard**: rejects `exceed_max_trade_notional` / `exceed_max_position_pct` / `exceed_max_positions`
+6. **Execution gate**: requires `market_gate_score >= threshold` and `--execute-trades` flag
+
+### Telegram news integration
+
+The pipeline supports merging Telegram news into the AlphaVantage news stream. TG messages are matched to tickers via a keyword map (`scripts/tg_ticker_map.yaml`), scored using a Chinese financial keyword dictionary, then converted to the same article schema as AlphaVantage — so existing `_compute_news_rank` and `_compute_round2_scores` work unchanged.
+
+**Enable with `--tg-news`:**
+
+```bash
+# Analysis with TG news from 金十bot (default channel)
+python scripts/run_analysis_trade_pipeline.py --tg-news
+
+# Custom channels and limits
+python scripts/run_analysis_trade_pipeline.py --tg-news --tg-channels jinshishuju_bot --tg-limit 100
+
+# With lower TG weight (default 0.8)
+python scripts/run_analysis_trade_pipeline.py --tg-news --tg-weight 0.6
+```
+
+**Or configure in `config.yaml`:**
+
+```yaml
+telegram:
+  enabled: true
+  session_path: "/path/to/tg_session.session"
+  channels:
+    - name: "jinshishuju_bot"
+      type: "dm"
+      limit: 50
+  ticker_map: "scripts/tg_ticker_map.yaml"
+  sentiment_mode: "keyword"
+  tg_weight: 0.8
+```
+
+**Standalone testing:**
+
+```bash
+# Test TG news fetch independently
+python scripts/query_tg_news.py --channels jinshishuju_bot --limit 30
+
+# Filter to specific tickers
+python scripts/query_tg_news.py --channels jinshishuju_bot --tickers USO,GLD,SPY --json
+```
+
+**How sentiment scoring works for Chinese news:**
+- Keyword dictionary with ~60 bullish/bearish terms and intensity weights
+- 金十bot tags (e.g. `【原油】`, `【伊朗局势】`) mapped directly to sector/ticker
+- Star ratings (`★` / `★★`) used as importance weights
+- Scores multiplied by `tg_weight` (default 0.8) before merging with AV data
 
 ## Known limitations (0.1.0)
 

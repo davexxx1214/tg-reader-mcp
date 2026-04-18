@@ -41,26 +41,40 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
-### 2. 登录一次 Telegram
+### 2. 获取 Telegram session 文件
 
-需要一个 Telethon 的 `.session` 文件。最简方式——跑一次交互式登录脚本：
+需要一个 Telethon 的 `.session` 文件，有两种方式：
 
-```python
-# login.py
-from telethon import TelegramClient
-client = TelegramClient('tg_session', 94575, 'a3406de8d171bb422bb6ddf3bbd800e2')
-client.start()
-print("登录成功，tg_session.session 已创建")
+**方式 A：从已有机器复制（推荐，免交互登录）**
+
+如果已在其他机器上生成过 `tg_session.session`，直接复制到项目根目录：
+
+```bash
+scp tg_session.session user@host:/path/to/tg-reader-mcp/
+chmod 600 tg_session.session
 ```
+
+**方式 B：在当前机器上交互登录生成**
+
+先复制配置模板并填入 Telegram API 凭证：
+
+```bash
+cp config.example.yaml config.yaml
+# 编辑 config.yaml，填入 telegram_api.api_id 和 telegram_api.api_hash
+# 申请地址: https://my.telegram.org/apps
+```
+
+然后运行登录脚本：
 
 ```bash
 python login.py
 # 输入手机号 + Telegram 发来的验证码 + 开启了 2FA 再输密码
+chmod 600 tg_session.session
 ```
 
-当前目录下会生成 `tg_session.session`，这就是你的登录凭证。
-
-> 上面的 `API_ID` / `API_HASH` 是 Telegram Desktop 的公开凭证，可以直接用。想要自己的（提升限流配额或独立审计），去 [my.telegram.org](https://my.telegram.org) 申请，然后设置 `TG_API_ID` / `TG_API_HASH` 环境变量。
+> `.session` 文件等同登录密码，已被 `.gitignore` 忽略。部署到新机器时需手动复制。
+>
+> `server.py` 中默认的 `API_ID` / `API_HASH` 是 Telegram Desktop 的公开凭证，MCP 服务本身可以直接用。`login.py` 从 `config.yaml` 读取，如果想用自己的凭证（提升限流配额或独立审计），去 [my.telegram.org](https://my.telegram.org) 申请即可。
 
 ### 3. 接入 Claude Code
 
@@ -114,6 +128,164 @@ Telegram ToS：[telegram.org/tos](https://telegram.org/tos) · API ToS：[core.t
 ## 真实示例频道
 
 [@runesgangalpha](https://t.me/runesgangalpha) — 我的公开频道，用的就是这个 MCP 在做 Polymarket / AI / Crypto 信号的读取和消化，算是这个工作流的活样本。
+
+## 集成：alpaca-live-trading skill
+
+本 MCP 的核心用途之一是作为 [alpaca-live-trading](https://github.com/runesleo/alpaca-live-trading) 交易系统的**信号源**。典型流程：通过 `tg-reader-mcp` 读取 Telegram 金融新闻频道（如金十bot、alpha 信号群），将信息注入交易 pipeline 用于情绪分析和交易决策。
+
+### 架构
+
+```
+Telegram 频道              tg-reader-mcp (MCP)         alpaca-live-trading
+┌──────────────┐          ┌──────────────────┐         ┌──────────────────┐
+│ 金十bot       │─────────▶│ list_dialogs     │         │ 第一阶段：预筛选   │
+│ Alpha 信号群   │          │ read_channel     │────────▶│ 第二阶段：深度分析  │
+│ Crypto 资讯   │          │ search_channel   │         │ 交易执行           │
+└──────────────┘          │ mark_read        │         └──────────────────┘
+                          └──────────────────┘
+```
+
+### 数据管道
+
+alpaca-live-trading 运行两阶段分析 pipeline：
+
+**第一阶段 — 预筛选**：用技术面策略（如 `w_bottom_breakout`、`autoresearch_trend`）筛选候选标的。数据源：本地 SQLite（日线 + 基本面）。
+
+**第二阶段 — 深度分析**：对每个候选 + 基准 ETF（QQQ, SPY）采集：
+- AlphaVantage 新闻情绪 + 基本面（OVERVIEW / INCOME_STATEMENT / BALANCE_SHEET / CASH_FLOW）
+- Alpaca 行情 + SQLite 技术指标
+- Polymarket 赔率用于市场门控
+- **Telegram 频道信号**（通过本 MCP）—— 搜索个股提及、读取突发新闻、从金融新闻 bot 获取情绪
+
+### 支持的 Telegram 信号源
+
+| 频道 | 用户名 | 用途 |
+|------|--------|------|
+| 金十bot | `@jinshishuju_bot` | 实时财经新闻（地缘政治、宏观、大宗商品） |
+| 自定义 alpha 频道 | 各异 | 通过 `search_channel` 做个股信号研究 |
+
+### 示例工作流：新闻驱动的交易信号
+
+```
+1. Agent 调用 list_dialogs(filter="unread_dm") → 发现金十bot有11条未读
+2. Agent 调用 read_channel(channel="jinshishuju_bot", limit=50) → 获取最新新闻
+3. Agent 提取关键信号："伊拉克恢复南部石油出口" → 原油看涨信号
+4. alpaca-live-trading pipeline 交叉验证：
+   - AlphaVantage 石油板块基本面
+   - Polymarket 伊朗/中东局势赔率
+   - 本地 SQLite 技术指标
+5. Pipeline 生成交易计划 → 风控校验 → 执行（需 --execute-trades 标志）
+6. Agent 调用 mark_read(channel="jinshishuju_bot") → 清除未读队列
+```
+
+### alpaca-live-trading 数据基础设施
+
+交易系统维护本地 SQLite 数据库：
+
+**日线数据**（`data/stock_daily.sqlite`）：
+- `stock_daily` — OHLCV，主键 `(symbol, trade_date)`
+- 同步策略：首次 `outputsize=full`，后续 `outputsize=compact`，不足时回退 full
+
+**基本面**（5年季度窗口）：
+- `fundamentals_quarterly` — 收入、营业利润、净利润、现金流、资产负债
+- `fundamentals_overview_daily` — 市值、PE、利润率、ROE/ROA、做空比率
+
+**同步脚本**：
+
+```bash
+# 日线（单只 / 批量 / 默认池）
+python scripts/sync_alpha_daily_to_sqlite.py --symbol AAPL
+python scripts/sync_alpha_daily_to_sqlite.py --symbols AAPL,MSFT,NVDA --max-calls-per-minute 75
+
+# 基本面
+python scripts/sync_alpha_fundamentals_to_sqlite.py --symbol AAPL --years 5
+python scripts/sync_alpha_fundamentals_to_sqlite.py --default-pool --years 5 --batch-size 20
+
+# 查询
+python scripts/query_fundamentals_sqlite.py --symbol BABA --quarters 8
+python scripts/query_prices_sqlite.py --symbols AAPL,NVDA --days 60
+```
+
+### 运行 pipeline
+
+```bash
+# 仅分析（不下单）
+python scripts/run_analysis_trade_pipeline.py
+
+# 分析 + 自动执行（受 market gate + risk guard 控制）
+python scripts/run_analysis_trade_pipeline.py --execute-trades
+```
+
+`config.yaml` 配置：
+
+```yaml
+strategy:
+  enabled: true
+  name: w_bottom_breakout
+  min_confidence: 0.6
+  prefilter_top_k: 10
+
+market_gate:
+  benchmark_tickers: [QQQ, SPY]
+  threshold: -0.05
+```
+
+### 交易决策逻辑
+
+1. **Round2 综合评分**：`fundamental_score`（50%）+ `technical_score`（30%）+ `news_score`（20%，带时效衰减）
+2. **通过规则**：保留 `score >= 0.4` 的标的，若无达标则回退 top-k
+3. **置信度融合**：`0.7 × stage1_confidence + 0.3 × round2_score`
+4. **仓位计算**：`qty = floor(min(可用现金 × max_position_pct, max_trade_notional) / 价格)`
+5. **风控拦截**：拒绝 `exceed_max_trade_notional` / `exceed_max_position_pct` / `exceed_max_positions`
+6. **执行门控**：需要 `market_gate_score >= threshold` 且命令包含 `--execute-trades`
+
+### Telegram 新闻集成
+
+Pipeline 支持将 Telegram 新闻合并到 AlphaVantage 新闻流中。TG 消息通过关键词映射表（`scripts/tg_ticker_map.yaml`）匹配 ticker，用中文财经关键词词典打分，然后转化为与 AlphaVantage 相同的 article schema —— 现有的 `_compute_news_rank` 和 `_compute_round2_scores` 无需改动。
+
+**通过 `--tg-news` 启用：**
+
+```bash
+# 分析时加入金十bot新闻（默认频道）
+python scripts/run_analysis_trade_pipeline.py --tg-news
+
+# 自定义频道和条数
+python scripts/run_analysis_trade_pipeline.py --tg-news --tg-channels jinshishuju_bot --tg-limit 100
+
+# 调低 TG 权重（默认 0.8）
+python scripts/run_analysis_trade_pipeline.py --tg-news --tg-weight 0.6
+```
+
+**或在 `config.yaml` 中配置：**
+
+```yaml
+telegram:
+  enabled: true
+  session_path: "/path/to/tg_session.session"
+  channels:
+    - name: "jinshishuju_bot"
+      type: "dm"
+      limit: 50
+  ticker_map: "scripts/tg_ticker_map.yaml"
+  sentiment_mode: "keyword"
+  tg_weight: 0.8
+```
+
+**独立测试：**
+
+```bash
+# 单独测试 TG 新闻采集
+python scripts/query_tg_news.py --channels jinshishuju_bot --limit 30
+
+# 只匹配指定 ticker
+python scripts/query_tg_news.py --channels jinshishuju_bot --tickers USO,GLD,SPY --json
+```
+
+**中文新闻情绪打分原理：**
+- 约 60 个看涨/看跌关键词，带强度权重
+- 金十bot 标签（如 `【原油】`、`【伊朗局势】`）直接映射到 sector/ticker
+- 星级（`★` / `★★`）作为重要性权重
+- 分数乘以 `tg_weight`（默认 0.8）后再与 AV 数据合并
 
 ## 当前版本限制（0.1.0）
 
