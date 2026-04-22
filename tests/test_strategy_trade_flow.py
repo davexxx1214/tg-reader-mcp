@@ -370,6 +370,53 @@ class OrderAndRiskTests(unittest.TestCase):
         self.assertIn("accepted_plan", guarded)
         self.assertIn("rejections", guarded)
 
+    def test_risk_guard_allows_add_on_same_symbol_when_under_limit(self):
+        risk_cfg = {
+            "max_position_pct": 0.2,   # 单标的上限 20%
+            "max_positions": 5,
+            "max_trade_notional": 2000,
+        }
+        account = {"cash": 5000, "buying_power": 5000, "equity": 10000}
+        positions = [
+            {"symbol": "TXN", "qty": 10, "current_price": 100},  # 现有约 $1000
+        ]
+        trade_plan = [
+            {"action": "buy", "symbol": "TXN", "qty": 5, "notional_estimate": 500},
+        ]
+
+        guarded = apply_risk_guard(
+            trade_plan=trade_plan,
+            risk_config=risk_cfg,
+            account_snapshot=account,
+            positions_snapshot=positions,
+        )
+        self.assertEqual(len(guarded["accepted_plan"]), 1)
+        self.assertEqual(len(guarded["rejections"]), 0)
+
+    def test_risk_guard_rejects_add_on_same_symbol_when_exceed_limit(self):
+        risk_cfg = {
+            "max_position_pct": 0.1,   # 单标的上限 10%
+            "max_positions": 5,
+            "max_trade_notional": 2000,
+        }
+        account = {"cash": 5000, "buying_power": 5000, "equity": 10000}
+        positions = [
+            {"symbol": "TXN", "qty": 10, "current_price": 90},  # 现有约 $900
+        ]
+        trade_plan = [
+            {"action": "buy", "symbol": "TXN", "qty": 2, "notional_estimate": 200},  # 累计 $1100 > $1000
+        ]
+
+        guarded = apply_risk_guard(
+            trade_plan=trade_plan,
+            risk_config=risk_cfg,
+            account_snapshot=account,
+            positions_snapshot=positions,
+        )
+        self.assertEqual(len(guarded["accepted_plan"]), 0)
+        self.assertEqual(len(guarded["rejections"]), 1)
+        self.assertIn("exceed_max_position_pct", guarded["rejections"][0]["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

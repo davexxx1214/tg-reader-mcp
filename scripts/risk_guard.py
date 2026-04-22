@@ -43,6 +43,39 @@ def _existing_position_symbols(positions: List[Dict[str, Any]]) -> Set[str]:
     return out
 
 
+def _position_market_value(pos: Dict[str, Any]) -> float:
+    """
+    估算单个持仓的当前市值（仅用于风控近似校验）。
+    优先使用 market_value，其次 qty * current_price，再其次 qty * avg_entry_price。
+    """
+    market_value = _to_float(pos.get("market_value"), 0.0)
+    if market_value > 0:
+        return market_value
+    qty = _to_float(pos.get("qty"), 0.0)
+    if qty <= 0:
+        return 0.0
+    current_price = _to_float(pos.get("current_price"), 0.0)
+    if current_price > 0:
+        return qty * current_price
+    avg_entry_price = _to_float(pos.get("avg_entry_price"), 0.0)
+    if avg_entry_price > 0:
+        return qty * avg_entry_price
+    return 0.0
+
+
+def _existing_position_values(positions: List[Dict[str, Any]]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for pos in positions or []:
+        symbol = _normalize_symbol(pos.get("symbol"))
+        if not symbol:
+            continue
+        qty = _to_float(pos.get("qty"), 0.0)
+        if qty <= 0:
+            continue
+        out[symbol] = out.get(symbol, 0.0) + _position_market_value(pos)
+    return out
+
+
 def apply_risk_guard(
     trade_plan: List[Dict[str, Any]],
     risk_config: Dict[str, Any],
@@ -53,12 +86,16 @@ def apply_risk_guard(
     positions = positions_snapshot or []
 
     cash = max(_to_float(account.get("cash"), 0.0), _to_float(account.get("buying_power"), 0.0))
+    equity = max(_to_float(account.get("equity"), 0.0), _to_float(account.get("portfolio_value"), 0.0))
+    position_limit_base = equity if equity > 0 else cash
     max_position_pct = max(min(_to_float(risk_config.get("max_position_pct"), 0.1), 1.0), 0.0)
     max_positions = max(_to_int(risk_config.get("max_positions"), 5), 1)
     max_trade_notional = max(_to_float(risk_config.get("max_trade_notional"), 2000.0), 0.0)
 
     base_symbols = _existing_position_symbols(positions)
+    base_position_values = _existing_position_values(positions)
     simulated_symbols = set(base_symbols)
+    simulated_position_values = dict(base_position_values)
 
     accepted: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
@@ -80,8 +117,11 @@ def apply_risk_guard(
         if action == "buy":
             if max_trade_notional > 0 and notional > max_trade_notional:
                 reasons.append("exceed_max_trade_notional")
-            if cash > 0 and notional > cash * max_position_pct:
-                reasons.append("exceed_max_position_pct")
+            if position_limit_base > 0:
+                existing_value = simulated_position_values.get(symbol, 0.0)
+                projected_value = existing_value + max(notional, 0.0)
+                if projected_value > position_limit_base * max_position_pct:
+                    reasons.append("exceed_max_position_pct")
             projected_symbols = set(simulated_symbols)
             projected_symbols.add(symbol)
             if len(projected_symbols) > max_positions:
@@ -102,6 +142,7 @@ def apply_risk_guard(
         accepted.append(order)
         if action == "buy":
             simulated_symbols.add(symbol)
+            simulated_position_values[symbol] = simulated_position_values.get(symbol, 0.0) + max(notional, 0.0)
         elif action == "sell":
             # 仅在没有其它 buy 同 symbol 时尝试从集合移除
             has_pending_buy = any(
@@ -116,6 +157,7 @@ def apply_risk_guard(
         "rejections": rejected,
         "risk_snapshot": {
             "cash": cash,
+            "position_limit_base": position_limit_base,
             "max_position_pct": max_position_pct,
             "max_positions": max_positions,
             "max_trade_notional": max_trade_notional,
