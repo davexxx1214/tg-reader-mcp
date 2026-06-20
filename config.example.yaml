@@ -27,6 +27,23 @@ alpaca:
   secret_key: "your_alpaca_secret_key"
   paper: true
 
+# TACO + 金十bot QQQ-only 择时策略
+taco_strategy:
+  enabled: true
+  dashboard_url: "https://ocmacro.com/dashboard/trump"
+  symbol: QQQ
+  taco_db: "data/taco_daily.sqlite"
+  jin10_db: "data/jin10_messages.sqlite"
+  jin10_channel: "jinshishuju_bot"
+  smoothing_days: 3
+  news_half_life_days: 2
+  risk_beta: -3.0
+  relief_beta: 5.0
+  buy_threshold: -4.0
+  max_data_age_days: 7
+  require_fresh_news: true
+  transaction_cost_bps: 10.0
+
 # Polymarket - 不需要 API Key（公开 API）
 
 # 策略执行配置（自动生成交易计划）

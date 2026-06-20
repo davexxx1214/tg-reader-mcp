@@ -129,7 +129,52 @@ Telegram ToS: [telegram.org/tos](https://telegram.org/tos) · API ToS: [core.tel
 
 Follow [@runesgangalpha](https://t.me/runesgangalpha) — my public channel where I use this exact MCP to read and digest Polymarket, AI, and crypto signals. It's a live demo of the workflow.
 
-## Integration: alpaca-live-trading skill
+## Current default strategy: TACO + Jin10 QQQ timing
+
+The default trading pipeline now trades only `QQQ` and has two states: 100% QQQ or 100% cash. The legacy stock-pool, fundamentals, Polymarket, and per-ticker Telegram scoring stages are no longer part of the default strategy.
+
+```text
+signal = 3-day smoothed TACO - 3.0 * Jin10 risk intensity + 5.0 * Jin10 relief intensity
+
+signal <= -4.0  -> hold QQQ
+signal >  -4.0  -> cash
+```
+
+The decision always uses the latest completed data day before execution. The strategy is long/cash only, uses no leverage, and applies 10bps transaction costs in backtests.
+
+### Download data
+
+```powershell
+.\.venv\Scripts\python.exe scripts\sync_taco_data.py
+.\.venv\Scripts\python.exe scripts\collect_jin10_messages.py backfill --start 2026-04-18 --end 2026-06-17
+.\.venv\Scripts\python.exe scripts\collect_jin10_messages.py incremental --limit 500
+.\.venv\Scripts\python.exe scripts\sync_alpha_daily_to_sqlite.py --symbols QQQ
+```
+
+### Backtest
+
+```powershell
+.\.venv\Scripts\python.exe scripts\backtest_taco_jin10_qqq.py --start 2026-04-18 --end 2026-06-17
+```
+
+Outputs are written to `data/backtests/taco_jin10_qqq/summary.json` and `daily.tsv`.
+
+### Trading pipeline
+
+```powershell
+# Dry-run with data refresh
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --skip-account-refresh
+
+# Deterministic dry-run using existing local data
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --skip-data-sync --skip-account-refresh --signal-date 2026-06-17
+
+# Explicit live execution with a fresh Alpaca account snapshot
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --execute-trades
+```
+
+Live orders remain opt-in. Sells execute first, and the pipeline stops immediately when any order is not `filled`.
+
+## Integration: alpaca-live-trading skill (legacy flow)
 
 This MCP is designed to work as a **signal source** for the [alpaca-live-trading](https://github.com/runesleo/alpaca-live-trading) system. The typical flow: read financial news from Telegram channels (e.g. 金十bot, alpha signal groups) via `tg-reader-mcp`, feed them into the trading pipeline for sentiment analysis and trade decisions.
 

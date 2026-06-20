@@ -3,6 +3,7 @@ import sys
 import sqlite3
 import unittest
 import tempfile
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -272,6 +273,7 @@ class PipelineSyncTests(unittest.TestCase):
                 symbols=["FRESH", "STALE", "SHORTQ", "MISSING"],
                 stale_after_days=7,
                 min_quarterly_rows=5,
+                as_of_date=date(2026, 4, 10),
             )
             self.assertEqual(selected, ["STALE", "SHORTQ", "MISSING"])
 

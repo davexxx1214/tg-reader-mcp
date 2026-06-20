@@ -51,6 +51,8 @@ config.yaml
 balance.jsonl
 position.jsonl
 analysis_pipeline_latest.json
+data/taco_qqq_pipeline_latest.json
+data/backtests/
 
 # SQLite databases (runtime generated)
 *.db

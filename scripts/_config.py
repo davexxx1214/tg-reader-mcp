@@ -40,6 +40,22 @@ DEFAULT_MARKET_GATE_CONFIG: Dict[str, Any] = {
     "benchmark_tickers": ["QQQ", "SPY"],
     "threshold": -0.05,
 }
+DEFAULT_TACO_STRATEGY_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "symbol": "QQQ",
+    "dashboard_url": "https://ocmacro.com/dashboard/trump",
+    "taco_db": "data/taco_daily.sqlite",
+    "jin10_db": "data/jin10_messages.sqlite",
+    "jin10_channel": "jinshishuju_bot",
+    "smoothing_days": 3,
+    "news_half_life_days": 2,
+    "risk_beta": -3.0,
+    "relief_beta": 5.0,
+    "buy_threshold": -4.0,
+    "max_data_age_days": 7,
+    "require_fresh_news": True,
+    "transaction_cost_bps": 10.0,
+}
 
 
 def load_config(config_path: Path = None) -> Dict[str, Any]:
@@ -159,6 +175,48 @@ def get_strategy_config(config: Dict[str, Any] = None) -> Dict[str, Any]:
         "names": names,
         "min_confidence": _clamp(min_conf, 0.0, 1.0),
         "prefilter_top_k": max(prefilter_top_k, 1),
+    }
+
+
+def get_taco_strategy_config(config: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Return validated configuration for the TACO + Jin10 QQQ timing strategy."""
+    if config is None:
+        config = load_config()
+    raw = config.get("taco_strategy", {}) if isinstance(config, dict) else {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def as_float(key: str) -> float:
+        try:
+            return float(raw.get(key, DEFAULT_TACO_STRATEGY_CONFIG[key]))
+        except (TypeError, ValueError):
+            return float(DEFAULT_TACO_STRATEGY_CONFIG[key])
+
+    def as_int(key: str) -> int:
+        try:
+            return int(raw.get(key, DEFAULT_TACO_STRATEGY_CONFIG[key]))
+        except (TypeError, ValueError):
+            return int(DEFAULT_TACO_STRATEGY_CONFIG[key])
+
+    symbol = str(raw.get("symbol", DEFAULT_TACO_STRATEGY_CONFIG["symbol"]) or "QQQ").upper().strip()
+    return {
+        "enabled": _to_bool(raw.get("enabled", True), True),
+        "symbol": symbol or "QQQ",
+        "dashboard_url": str(raw.get("dashboard_url", DEFAULT_TACO_STRATEGY_CONFIG["dashboard_url"])),
+        "taco_db": str(raw.get("taco_db", DEFAULT_TACO_STRATEGY_CONFIG["taco_db"])),
+        "jin10_db": str(raw.get("jin10_db", DEFAULT_TACO_STRATEGY_CONFIG["jin10_db"])),
+        "jin10_channel": str(raw.get("jin10_channel", DEFAULT_TACO_STRATEGY_CONFIG["jin10_channel"])),
+        "smoothing_days": max(as_int("smoothing_days"), 1),
+        "news_half_life_days": max(as_int("news_half_life_days"), 1),
+        "risk_beta": as_float("risk_beta"),
+        "relief_beta": as_float("relief_beta"),
+        "buy_threshold": as_float("buy_threshold"),
+        "max_data_age_days": max(as_int("max_data_age_days"), 0),
+        "require_fresh_news": _to_bool(
+            raw.get("require_fresh_news", DEFAULT_TACO_STRATEGY_CONFIG["require_fresh_news"]),
+            True,
+        ),
+        "transaction_cost_bps": max(as_float("transaction_cost_bps"), 0.0),
     }
 
 

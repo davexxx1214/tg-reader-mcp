@@ -234,7 +234,7 @@ def _fetch_alpaca_snapshots(symbols: List[str], timeout_seconds: float) -> Dict[
         resp = requests.get(endpoint, headers=headers, params=params, timeout=max(timeout_seconds, 1.0))
         resp.raise_for_status()
         payload = resp.json()
-        snapshots = payload.get("snapshots", {}) if isinstance(payload, dict) else {}
+        snapshots = payload.get("snapshots", payload) if isinstance(payload, dict) else {}
         if not isinstance(snapshots, dict):
             continue
         for symbol in chunk:
