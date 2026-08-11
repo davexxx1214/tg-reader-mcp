@@ -129,35 +129,32 @@ Telegram ToS: [telegram.org/tos](https://telegram.org/tos) · API ToS: [core.tel
 
 Follow [@runesgangalpha](https://t.me/runesgangalpha) — my public channel where I use this exact MCP to read and digest Polymarket, AI, and crypto signals. It's a live demo of the workflow.
 
-## Current default strategy: TACO + Jin10 QQQ timing
+## Current default strategy: nTACO 100/20 QQQ sizing
 
-The default trading pipeline now trades only `QQQ` and has two states: 100% QQQ or 100% cash. The legacy stock-pool, fundamentals, Polymarket, and per-ticker Telegram scoring stages are no longer part of the default strategy.
+The default trading pipeline trades only `QQQ`. Each of the six TACO factors is ranked against up to 42 strictly prior observations, then combined with the published weights into a 0–100 nTACO index.
 
 ```text
-signal = 3-day smoothed TACO - 3.0 * Jin10 risk intensity + 5.0 * Jin10 relief intensity
-
-signal <= -4.0  -> hold QQQ
-signal >  -4.0  -> cash
+nTACO >= 49%  -> target 100% QQQ
+nTACO <= 30%  -> cap exposure at 80% QQQ (never buy from cash)
+30%–49%       -> preserve the previous target exposure
 ```
 
-The decision always uses the latest completed data day before execution. The strategy is long/cash only, uses no leverage, and applies 10bps transaction costs in backtests.
+The decision uses only data completed before the execution day. The strategy is long-only, uses no leverage, and applies 5bps one-way transaction costs in backtests. Jin10 news is no longer part of this strategy.
 
 ### Download data
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\sync_taco_data.py
-.\.venv\Scripts\python.exe scripts\collect_jin10_messages.py backfill --start 2026-04-18 --end 2026-06-17
-.\.venv\Scripts\python.exe scripts\collect_jin10_messages.py incremental --limit 500
 .\.venv\Scripts\python.exe scripts\sync_alpha_daily_to_sqlite.py --symbols QQQ
 ```
 
 ### Backtest
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\backtest_taco_jin10_qqq.py --start 2026-04-18 --end 2026-06-17
+.\.venv\Scripts\python.exe scripts\backtest_ntaco_qqq.py --start 2025-02-19
 ```
 
-Outputs are written to `data/backtests/taco_jin10_qqq/summary.json` and `daily.tsv`.
+Outputs are written to `data/backtests/ntaco_qqq_100_20/summary.json` and `daily.tsv`.
 
 ### Trading pipeline
 

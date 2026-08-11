@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- Replaced the legacy TACO + Jin10 binary QQQ timer with the causal nTACO 100/20 strategy.
+- Normalized six TACO factors against their strictly prior 42-observation history and removed Jin10 from the trading pipeline.
+- Added 30%/49% hysteresis with 80%/100% QQQ target exposure and 5bps one-way backtest costs.
+
 ## [0.1.0] - 2026-04-17
 
 First public release.

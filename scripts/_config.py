@@ -40,21 +40,46 @@ DEFAULT_MARKET_GATE_CONFIG: Dict[str, Any] = {
     "benchmark_tickers": ["QQQ", "SPY"],
     "threshold": -0.05,
 }
-DEFAULT_TACO_STRATEGY_CONFIG: Dict[str, Any] = {
+DEFAULT_NTACO_STRATEGY_CONFIG: Dict[str, Any] = {
     "enabled": True,
     "symbol": "QQQ",
     "dashboard_url": "https://ocmacro.com/dashboard/trump",
     "taco_db": "data/taco_daily.sqlite",
-    "jin10_db": "data/jin10_messages.sqlite",
-    "jin10_channel": "jinshishuju_bot",
-    "smoothing_days": 3,
-    "news_half_life_days": 2,
-    "risk_beta": -3.0,
-    "relief_beta": 5.0,
-    "buy_threshold": -4.0,
+    "state_file": "data/ntaco_strategy_state.json",
+    "normalization_lookback": 42,
+    "lower_threshold": 0.30,
+    "upper_threshold": 0.49,
+    "buy_exposure": 1.0,
+    "sell_fraction": 0.20,
     "max_data_age_days": 7,
-    "require_fresh_news": True,
-    "transaction_cost_bps": 10.0,
+    "transaction_cost_bps": 5.0,
+}
+DEFAULT_FACTOR_PORTFOLIO_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "mode": "ntaco_exposure_overlay",
+    "parameter_mode": "frozen",
+    "research_id": "v4_6_r1_0001",
+    "factor_db": "data/fama_french_daily.sqlite",
+    "signal_input": "data/factor_signal_input.csv",
+    "signal_manifest": "data/factor_signal_input.manifest.json",
+    "ntaco_signal_path": "data/taco_qqq_pipeline_latest.json",
+    "output_path": "data/factor_portfolio_latest.json",
+    "holdings": 10,
+    "max_names_per_industry": 3,
+    "minimum_industry_count": 10,
+    "minimum_adv20_usd": 10_000_000.0,
+    "winsor_lower": 0.01,
+    "winsor_upper": 0.99,
+    "factor_lag_months": 2,
+    "allocation_method": "equal_weight",
+    "rebalance_frequency": "monthly",
+    "weights": {
+        "size": 0.10,
+        "value": 0.30,
+        "profitability": 0.10,
+        "investment": 0.30,
+        "momentum": 0.20,
+    },
 }
 
 
@@ -178,46 +203,150 @@ def get_strategy_config(config: Dict[str, Any] = None) -> Dict[str, Any]:
     }
 
 
-def get_taco_strategy_config(config: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Return validated configuration for the TACO + Jin10 QQQ timing strategy."""
+def get_ntaco_strategy_config(config: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Return validated configuration for the nTACO 100/20 QQQ strategy."""
     if config is None:
         config = load_config()
-    raw = config.get("taco_strategy", {}) if isinstance(config, dict) else {}
+    raw = config.get("ntaco_strategy", {}) if isinstance(config, dict) else {}
+    if not isinstance(raw, dict) or not raw:
+        legacy = config.get("taco_strategy", {}) if isinstance(config, dict) else {}
+        legacy = legacy if isinstance(legacy, dict) else {}
+        raw = {
+            key: legacy[key]
+            for key in ("enabled", "symbol", "dashboard_url", "taco_db", "max_data_age_days")
+            if key in legacy
+        }
+
+    def as_float(key: str) -> float:
+        try:
+            return float(raw.get(key, DEFAULT_NTACO_STRATEGY_CONFIG[key]))
+        except (TypeError, ValueError):
+            return float(DEFAULT_NTACO_STRATEGY_CONFIG[key])
+
+    def as_int(key: str) -> int:
+        try:
+            return int(raw.get(key, DEFAULT_NTACO_STRATEGY_CONFIG[key]))
+        except (TypeError, ValueError):
+            return int(DEFAULT_NTACO_STRATEGY_CONFIG[key])
+
+    symbol = str(raw.get("symbol", DEFAULT_NTACO_STRATEGY_CONFIG["symbol"]) or "QQQ").upper().strip()
+    lower = _clamp(as_float("lower_threshold"), 0.0, 1.0)
+    upper = _clamp(as_float("upper_threshold"), 0.0, 1.0)
+    if lower >= upper:
+        lower = float(DEFAULT_NTACO_STRATEGY_CONFIG["lower_threshold"])
+        upper = float(DEFAULT_NTACO_STRATEGY_CONFIG["upper_threshold"])
+    return {
+        "enabled": _to_bool(raw.get("enabled", True), True),
+        "symbol": symbol or "QQQ",
+        "dashboard_url": str(raw.get("dashboard_url", DEFAULT_NTACO_STRATEGY_CONFIG["dashboard_url"])),
+        "taco_db": str(raw.get("taco_db", DEFAULT_NTACO_STRATEGY_CONFIG["taco_db"])),
+        "state_file": str(raw.get("state_file", DEFAULT_NTACO_STRATEGY_CONFIG["state_file"])),
+        "normalization_lookback": max(as_int("normalization_lookback"), 1),
+        "lower_threshold": lower,
+        "upper_threshold": upper,
+        "buy_exposure": _clamp(as_float("buy_exposure"), 0.0, 1.0),
+        "sell_fraction": _clamp(as_float("sell_fraction"), 0.0, 1.0),
+        "max_data_age_days": max(as_int("max_data_age_days"), 0),
+        "transaction_cost_bps": max(as_float("transaction_cost_bps"), 0.0),
+    }
+
+
+def get_factor_portfolio_config(config: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Return validated V4.6-R1 stock-selection and TACO-overlay settings."""
+    if config is None:
+        config = load_config()
+    raw = config.get("factor_portfolio", {}) if isinstance(config, dict) else {}
     if not isinstance(raw, dict):
         raw = {}
 
     def as_float(key: str) -> float:
         try:
-            return float(raw.get(key, DEFAULT_TACO_STRATEGY_CONFIG[key]))
-        except (TypeError, ValueError):
-            return float(DEFAULT_TACO_STRATEGY_CONFIG[key])
+            return float(raw.get(key, DEFAULT_FACTOR_PORTFOLIO_CONFIG[key]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"factor_portfolio.{key} must be numeric") from exc
 
     def as_int(key: str) -> int:
         try:
-            return int(raw.get(key, DEFAULT_TACO_STRATEGY_CONFIG[key]))
-        except (TypeError, ValueError):
-            return int(DEFAULT_TACO_STRATEGY_CONFIG[key])
+            return int(raw.get(key, DEFAULT_FACTOR_PORTFOLIO_CONFIG[key]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"factor_portfolio.{key} must be an integer") from exc
 
-    symbol = str(raw.get("symbol", DEFAULT_TACO_STRATEGY_CONFIG["symbol"]) or "QQQ").upper().strip()
-    return {
+    expected = set(DEFAULT_FACTOR_PORTFOLIO_CONFIG["weights"])
+    candidate = raw.get("weights", DEFAULT_FACTOR_PORTFOLIO_CONFIG["weights"])
+    if not isinstance(candidate, dict) or set(candidate) != expected:
+        raise ValueError("factor_portfolio.weights must contain exactly the five frozen signals")
+    try:
+        parsed = {key: float(candidate[key]) for key in expected}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("factor_portfolio.weights must be numeric") from exc
+    if any(value < 0.0 for value in parsed.values()) or abs(sum(parsed.values()) - 1.0) > 1e-12:
+        raise ValueError("factor_portfolio.weights must be non-negative and sum to 1")
+    weights = {key: parsed[key] for key in DEFAULT_FACTOR_PORTFOLIO_CONFIG["weights"]}
+
+    lower = as_float("winsor_lower")
+    upper = as_float("winsor_upper")
+    if not 0.0 <= lower < upper <= 1.0:
+        raise ValueError("factor_portfolio winsor limits are invalid")
+    allocation = str(raw.get("allocation_method", "equal_weight") or "equal_weight")
+    if allocation != "equal_weight":
+        raise ValueError("factor_portfolio only supports equal_weight allocation")
+    mode = str(raw.get("mode", DEFAULT_FACTOR_PORTFOLIO_CONFIG["mode"]))
+    if mode != "ntaco_exposure_overlay":
+        raise ValueError("factor_portfolio only supports ntaco_exposure_overlay mode")
+    rebalance = str(raw.get("rebalance_frequency", "monthly"))
+    if rebalance != "monthly":
+        raise ValueError("factor_portfolio only supports monthly rebalancing")
+    parameter_mode = str(raw.get("parameter_mode", "frozen")).strip().lower()
+    if parameter_mode not in {"frozen", "research"}:
+        raise ValueError("factor_portfolio.parameter_mode must be frozen or research")
+    research_id = str(raw.get("research_id", DEFAULT_FACTOR_PORTFOLIO_CONFIG["research_id"])).strip()
+    effective = {
         "enabled": _to_bool(raw.get("enabled", True), True),
-        "symbol": symbol or "QQQ",
-        "dashboard_url": str(raw.get("dashboard_url", DEFAULT_TACO_STRATEGY_CONFIG["dashboard_url"])),
-        "taco_db": str(raw.get("taco_db", DEFAULT_TACO_STRATEGY_CONFIG["taco_db"])),
-        "jin10_db": str(raw.get("jin10_db", DEFAULT_TACO_STRATEGY_CONFIG["jin10_db"])),
-        "jin10_channel": str(raw.get("jin10_channel", DEFAULT_TACO_STRATEGY_CONFIG["jin10_channel"])),
-        "smoothing_days": max(as_int("smoothing_days"), 1),
-        "news_half_life_days": max(as_int("news_half_life_days"), 1),
-        "risk_beta": as_float("risk_beta"),
-        "relief_beta": as_float("relief_beta"),
-        "buy_threshold": as_float("buy_threshold"),
-        "max_data_age_days": max(as_int("max_data_age_days"), 0),
-        "require_fresh_news": _to_bool(
-            raw.get("require_fresh_news", DEFAULT_TACO_STRATEGY_CONFIG["require_fresh_news"]),
-            True,
-        ),
-        "transaction_cost_bps": max(as_float("transaction_cost_bps"), 0.0),
+        "mode": mode,
+        "parameter_mode": parameter_mode,
+        "research_id": research_id,
+        "factor_db": str(raw.get("factor_db", DEFAULT_FACTOR_PORTFOLIO_CONFIG["factor_db"])),
+        "signal_input": str(raw.get("signal_input", DEFAULT_FACTOR_PORTFOLIO_CONFIG["signal_input"])),
+        "signal_manifest": str(raw.get("signal_manifest", DEFAULT_FACTOR_PORTFOLIO_CONFIG["signal_manifest"])),
+        "ntaco_signal_path": str(raw.get("ntaco_signal_path", DEFAULT_FACTOR_PORTFOLIO_CONFIG["ntaco_signal_path"])),
+        "output_path": str(raw.get("output_path", DEFAULT_FACTOR_PORTFOLIO_CONFIG["output_path"])),
+        "holdings": as_int("holdings"),
+        "max_names_per_industry": as_int("max_names_per_industry"),
+        "minimum_industry_count": as_int("minimum_industry_count"),
+        "minimum_adv20_usd": as_float("minimum_adv20_usd"),
+        "winsor_lower": lower,
+        "winsor_upper": upper,
+        "factor_lag_months": as_int("factor_lag_months"),
+        "allocation_method": allocation,
+        "rebalance_frequency": rebalance,
+        "weights": weights,
     }
+    if (
+        effective["holdings"] < 1
+        or effective["max_names_per_industry"] < 1
+        or effective["minimum_industry_count"] < 1
+        or effective["minimum_adv20_usd"] < 0.0
+        or effective["factor_lag_months"] < 2
+    ):
+        raise ValueError("factor_portfolio numeric limits are outside their safe range")
+    tunable = (
+        "mode", "holdings", "max_names_per_industry", "minimum_industry_count",
+        "minimum_adv20_usd", "winsor_lower", "winsor_upper", "factor_lag_months",
+        "allocation_method", "rebalance_frequency", "weights",
+    )
+    deviations = {
+        key: {"baseline": DEFAULT_FACTOR_PORTFOLIO_CONFIG[key], "effective": effective[key]}
+        for key in tunable
+        if effective[key] != DEFAULT_FACTOR_PORTFOLIO_CONFIG[key]
+    }
+    if parameter_mode == "frozen" and deviations:
+        raise ValueError(f"frozen V4.6-R1 parameters were changed: {', '.join(deviations)}")
+    if parameter_mode == "research" and (
+        not research_id or research_id == DEFAULT_FACTOR_PORTFOLIO_CONFIG["research_id"]
+    ):
+        raise ValueError("research mode requires a new, non-baseline research_id")
+    effective["baseline_deviations"] = deviations
+    return effective
 
 
 def get_risk_config(config: Dict[str, Any] = None) -> Dict[str, Any]:

@@ -19,13 +19,13 @@ class TacoSyncTests(unittest.TestCase):
                 first = upsert_taco_rows(
                     conn,
                     [
-                        {"date": "2026-06-10", "value": -1.0, "event_strength_score": 0.0},
-                        {"date": "2026-06-11", "value": -2.0, "event_strength_score": 1.0},
+                        {"date": "2026-06-10", "value": -1.0, "event_strength_score": 0.0, "raw": {"contributions": {"approval": 1.0}}},
+                        {"date": "2026-06-11", "value": -2.0, "event_strength_score": 1.0, "raw": {"contributions": {"approval": 2.0}}},
                     ],
                 )
                 second = upsert_taco_rows(
                     conn,
-                    [{"date": "2026-06-11", "value": -3.0, "event_strength_score": 1.0}],
+                    [{"date": "2026-06-11", "value": -3.0, "event_strength_score": 1.0, "raw": {"contributions": {"approval": 3.0}}}],
                 )
                 count = conn.execute("SELECT COUNT(*) FROM taco_daily").fetchone()[0]
 
@@ -35,6 +35,7 @@ class TacoSyncTests(unittest.TestCase):
             self.assertEqual(count, 2)
             self.assertEqual(rows[-1]["date"], "2026-06-11")
             self.assertEqual(rows[-1]["value"], -3.0)
+            self.assertEqual(rows[-1]["contributions"]["approval"], 3.0)
 
 
 if __name__ == "__main__":

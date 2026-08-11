@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Run the TACO + Jin10 QQQ-only data, signal, and rebalance pipeline."""
+"""Run the causal nTACO 100/20 QQQ data, signal, and rebalance pipeline."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 try:
@@ -23,8 +24,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from _config import get_taco_strategy_config, load_config
-from collect_jin10_messages import run_incremental
+from _config import get_ntaco_strategy_config, load_config
 from query_alpaca_account import (
     get_account_info,
     get_alpaca_client,
@@ -37,8 +37,8 @@ from sync_alpha_daily_to_sqlite import sync_symbols
 from sync_taco_data import load_taco_rows, sync_taco
 from taco_strategy import (
     build_rebalance_plan,
-    calculate_taco_jin10_signal,
-    load_jin10_messages,
+    calculate_ntaco_signal,
+    current_symbol_exposure,
     target_weights_for_exposure,
 )
 
@@ -181,16 +181,6 @@ def _execution_date(value: str) -> str:
     return datetime.now().date().isoformat()
 
 
-def _sync_jin10(*, db_path: Path, channel: str, limit: int, session_path: str) -> Dict[str, Any]:
-    args = SimpleNamespace(
-        db=str(db_path),
-        channel=channel,
-        session=session_path or None,
-        limit=max(int(limit), 1),
-    )
-    return run_incremental(args)
-
-
 def _sync_qqq_price(*, symbol: str, config: Mapping[str, Any], calls_per_minute: int) -> Dict[str, Any]:
     api_key = str(config.get("alphavantage", {}).get("api_key", "")).strip()
     if not api_key or api_key.startswith("your_"):
@@ -202,7 +192,7 @@ def _sync_qqq_price(*, symbol: str, config: Mapping[str, Any], calls_per_minute:
         max_calls_per_minute=max(int(calls_per_minute), 1),
         batch_size=0,
         with_audit=False,
-        job_name="taco_jin10_qqq_pipeline",
+        job_name="ntaco_qqq_100_20_pipeline",
     )
     return {"symbol": symbol, "inserted_rows": inserted, "db": str(Path(DEFAULT_PRICE_DB).resolve())}
 
@@ -272,15 +262,104 @@ def _load_account(*, skip_refresh: bool, execute_trades: bool) -> tuple[Dict[str
         return account, positions, {"status": "fallback_local"}
 
 
+def _load_strategy_state_exposure(path: Path, symbol: str, fallback: float) -> float:
+    """Read the last committed nTACO target from its versioned state contract."""
+    if not path.exists():
+        return fallback
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback
+    if payload.get("schema_version") != 1 or payload.get("strategy") != "ntaco_qqq_100_20":
+        return fallback
+    if str(payload.get("symbol", "")).upper() != str(symbol).upper():
+        return fallback
+    try:
+        exposure = float(payload["target_exposure"])
+    except (KeyError, TypeError, ValueError):
+        return fallback
+    if not 0.0 <= exposure <= 1.0:
+        return fallback
+    return exposure
+
+
+def _trade_execution_succeeded(
+    trade_plan: List[Dict[str, Any]],
+    trade_results: List[Dict[str, Any]],
+) -> bool:
+    if not trade_plan:
+        return True
+    if len(trade_results) != len(trade_plan):
+        return False
+    return all(
+        isinstance(item, dict)
+        and item.get("status") == "ok"
+        and str(item.get("trade", {}).get("status", "")).lower() == "filled"
+        for item in trade_results
+    )
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _write_strategy_state(
+    path: Path,
+    *,
+    symbol: str,
+    target_exposure: float,
+    signal_date: str,
+) -> None:
+    _atomic_write_json(
+        path,
+        {
+            "schema_version": 1,
+            "strategy": "ntaco_qqq_100_20",
+            "symbol": str(symbol).upper(),
+            "target_exposure": float(target_exposure),
+            "signal_date": str(signal_date),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
+
+
+@contextmanager
+def _exclusive_run_lock(state_path: Path):
+    """Prevent overlapping dry/live runs from producing duplicate orders or state races."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    try:
+        descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise RuntimeError(f"nTACO pipeline is already running; lock exists: {lock_path}") from exc
+    try:
+        os.write(descriptor, str(os.getpid()).encode("ascii"))
+        yield
+    finally:
+        os.close(descriptor)
+        lock_path.unlink(missing_ok=True)
+
+
+def _enforce_low_signal_no_buy(signal: Mapping[str, Any], *, current_exposure: float) -> Dict[str, Any]:
+    """A low nTACO signal may trim exposure, but must never create a QQQ purchase."""
+    guarded = dict(signal)
+    actual = min(max(float(current_exposure), 0.0), 1.0)
+    if guarded.get("regime") == "low" and float(guarded.get("exposure", 0.0)) > actual:
+        guarded["exposure"] = actual
+        guarded["action"] = "hold_low_no_buy"
+    return guarded
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run TACO + Jin10 QQQ-only timing pipeline")
+    parser = argparse.ArgumentParser(description="Run nTACO 100/20 QQQ-only timing pipeline")
     parser.add_argument("--execute-trades", action="store_true", help="Submit live Alpaca orders; default is dry-run")
     parser.add_argument("--skip-account-refresh", action="store_true")
-    parser.add_argument("--skip-data-sync", action="store_true", help="Use existing TACO, Jin10, and QQQ data")
+    parser.add_argument("--skip-data-sync", action="store_true", help="Use existing TACO and QQQ data")
     parser.add_argument("--skip-taco-sync", action="store_true")
-    parser.add_argument("--skip-jin10-sync", action="store_true")
     parser.add_argument("--skip-price-sync", action="store_true")
-    parser.add_argument("--jin10-limit", type=int, default=500)
     parser.add_argument("--av-calls-per-minute", type=int, default=75)
     parser.add_argument("--signal-date", default="", help="Execution date for deterministic dry-run only")
     parser.add_argument(
@@ -291,22 +370,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def _run_pipeline(
+    args: argparse.Namespace,
+    *,
+    config: Mapping[str, Any],
+    strategy: Mapping[str, Any],
+    state_path: Path,
+) -> tuple[Dict[str, Any], Path]:
     validate_run_options(
         execute_trades=bool(args.execute_trades),
         skip_account_refresh=bool(args.skip_account_refresh),
         signal_date=str(args.signal_date or ""),
     )
-    config = load_config()
-    strategy = get_taco_strategy_config(config)
     if not strategy["enabled"]:
-        raise RuntimeError("taco_strategy.enabled must be true")
+        raise RuntimeError("ntaco_strategy.enabled must be true")
 
     symbol = strategy["symbol"]
     taco_db = _resolve_root_path(strategy["taco_db"])
-    jin10_db = _resolve_root_path(strategy["jin10_db"])
     execution_date = _execution_date(args.signal_date)
+    output_path = _resolve_root_path(args.output_file)
     skip_all = bool(args.skip_data_sync)
     sync_results: Dict[str, Any] = {}
 
@@ -316,20 +398,6 @@ def main() -> None:
         sync_results["taco"] = {
             "status": "ok",
             **sync_taco(db_path=taco_db, url=strategy["dashboard_url"]),
-        }
-
-    if skip_all or args.skip_jin10_sync:
-        sync_results["jin10"] = {"status": "skipped", "db": str(jin10_db)}
-    else:
-        telegram = config.get("telegram", {}) if isinstance(config, dict) else {}
-        sync_results["jin10"] = {
-            "status": "ok",
-            **_sync_jin10(
-                db_path=jin10_db,
-                channel=strategy["jin10_channel"],
-                limit=args.jin10_limit,
-                session_path=str(telegram.get("session_path") or ""),
-            ),
         }
 
     if skip_all or args.skip_price_sync:
@@ -345,31 +413,31 @@ def main() -> None:
         }
 
     taco_rows = load_taco_rows(taco_db)
-    jin10_rows = load_jin10_messages(
-        jin10_db,
-        end_date_inclusive=(date.fromisoformat(execution_date)).isoformat(),
-        channel=strategy["jin10_channel"],
-    )
-    signal = calculate_taco_jin10_signal(
-        taco_rows,
-        jin10_rows,
-        execution_date=execution_date,
-        smoothing_days=strategy["smoothing_days"],
-        news_half_life_days=strategy["news_half_life_days"],
-        risk_beta=strategy["risk_beta"],
-        relief_beta=strategy["relief_beta"],
-        buy_threshold=strategy["buy_threshold"],
-        max_data_age_days=strategy["max_data_age_days"],
-        require_fresh_news=True,
-    )
-    target_weights = target_weights_for_exposure(symbol, signal["exposure"])
-
     account, positions, account_refresh = _load_account(
         skip_refresh=bool(args.skip_account_refresh),
         execute_trades=bool(args.execute_trades),
     )
     if float(account.get("equity") or account.get("portfolio_value") or 0.0) <= 0:
         raise RuntimeError("No valid Alpaca account snapshot is available")
+    current_exposure = current_symbol_exposure(symbol, account=account, positions=positions)
+    prior_exposure = (
+        current_exposure
+        if args.signal_date
+        else _load_strategy_state_exposure(state_path, symbol, current_exposure)
+    )
+    signal = calculate_ntaco_signal(
+        taco_rows,
+        execution_date=execution_date,
+        prior_exposure=prior_exposure,
+        lower_threshold=strategy["lower_threshold"],
+        upper_threshold=strategy["upper_threshold"],
+        buy_exposure=strategy["buy_exposure"],
+        sell_fraction=strategy["sell_fraction"],
+        normalization_lookback=strategy["normalization_lookback"],
+        max_data_age_days=strategy["max_data_age_days"],
+    )
+    signal = _enforce_low_signal_no_buy(signal, current_exposure=current_exposure)
+    target_weights = target_weights_for_exposure(symbol, signal["exposure"])
     prices = _load_prices(symbol, positions, require_live=bool(args.execute_trades))
     trade_plan = build_rebalance_plan(
         account=account,
@@ -378,6 +446,13 @@ def main() -> None:
         target_weights=target_weights,
     )
     trade_results = _execute_trade_plan(trade_plan) if args.execute_trades else []
+    if args.execute_trades and _trade_execution_succeeded(trade_plan, trade_results):
+        _write_strategy_state(
+            state_path,
+            symbol=symbol,
+            target_exposure=float(signal["exposure"]),
+            signal_date=str(signal["signal_date"]),
+        )
 
     output = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -391,9 +466,22 @@ def main() -> None:
         "trade_plan": trade_plan,
         "trade_results": trade_results,
     }
-    output_path = _resolve_root_path(args.output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(output_path, output)
+    return output, output_path
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    config = load_config()
+    strategy = get_ntaco_strategy_config(config)
+    state_path = _resolve_root_path(strategy["state_file"])
+    with _exclusive_run_lock(state_path):
+        output, output_path = _run_pipeline(
+            args,
+            config=config,
+            strategy=strategy,
+            state_path=state_path,
+        )
     print(json.dumps(output, ensure_ascii=False, indent=2))
     print(f"Result written to: {output_path}")
 

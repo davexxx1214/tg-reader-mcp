@@ -27,22 +27,47 @@ alpaca:
   secret_key: "your_alpaca_secret_key"
   paper: true
 
-# TACO + 金十bot QQQ-only 择时策略
-taco_strategy:
+# nTACO 100%买入 / 20%卖出 QQQ-only 仓位策略
+ntaco_strategy:
   enabled: true
   dashboard_url: "https://ocmacro.com/dashboard/trump"
   symbol: QQQ
   taco_db: "data/taco_daily.sqlite"
-  jin10_db: "data/jin10_messages.sqlite"
-  jin10_channel: "jinshishuju_bot"
-  smoothing_days: 3
-  news_half_life_days: 2
-  risk_beta: -3.0
-  relief_beta: 5.0
-  buy_threshold: -4.0
+  state_file: "data/ntaco_strategy_state.json"
+  normalization_lookback: 42
+  lower_threshold: 0.30
+  upper_threshold: 0.49
+  buy_exposure: 1.0
+  sell_fraction: 0.20
   max_data_age_days: 7
-  require_fresh_news: true
-  transaction_cost_bps: 10.0
+  transaction_cost_bps: 5.0
+
+# V4.6-R1 十股因子篮子；nTACO 只控制总暴露，不进入个股综合分
+factor_portfolio:
+  enabled: true
+  mode: ntaco_exposure_overlay
+  parameter_mode: frozen
+  research_id: v4_6_r1_0001
+  factor_db: "data/fama_french_daily.sqlite"
+  signal_input: "data/factor_signal_input.csv"
+  signal_manifest: "data/factor_signal_input.manifest.json"
+  ntaco_signal_path: "data/taco_qqq_pipeline_latest.json"
+  output_path: "data/factor_portfolio_latest.json"
+  holdings: 10
+  max_names_per_industry: 3
+  minimum_industry_count: 10
+  minimum_adv20_usd: 10000000
+  winsor_lower: 0.01
+  winsor_upper: 0.99
+  factor_lag_months: 2
+  allocation_method: equal_weight
+  rebalance_frequency: monthly
+  weights:
+    size: 0.10
+    value: 0.30
+    profitability: 0.10
+    investment: 0.30
+    momentum: 0.20
 
 # Polymarket - 不需要 API Key（公开 API）
 

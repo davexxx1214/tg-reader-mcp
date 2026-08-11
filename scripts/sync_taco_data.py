@@ -93,7 +93,7 @@ def load_taco_rows(
     try:
         rows = conn.execute(
             f"""
-            SELECT trade_date, taco_index, event_strength_score
+            SELECT trade_date, taco_index, event_strength_score, raw_json
             FROM taco_daily
             {where}
             ORDER BY trade_date
@@ -102,10 +102,23 @@ def load_taco_rows(
         ).fetchall()
     finally:
         conn.close()
-    return [
-        {"date": str(row[0]), "value": float(row[1]), "event_strength_score": float(row[2])}
-        for row in rows
-    ]
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            raw = json.loads(str(row[3]))
+        except (TypeError, json.JSONDecodeError):
+            raw = {}
+        contributions = raw.get("contributions") if isinstance(raw, dict) else None
+        result.append(
+            {
+                "date": str(row[0]),
+                "value": float(row[1]),
+                "event_strength_score": float(row[2]),
+                "contributions": dict(contributions) if isinstance(contributions, dict) else {},
+                "raw": raw,
+            }
+        )
+    return result
 
 
 def sync_taco(

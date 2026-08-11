@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backtest the deployed TACO + Jin10 QQQ-only timing rule."""
+"""Backtest the deployed causal nTACO 100/20 QQQ-only timing rule."""
 
 from __future__ import annotations
 
@@ -8,18 +8,19 @@ import csv
 import json
 import math
 import sqlite3
+from datetime import date
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any, Dict, Iterable, List, Mapping
 
-from _config import get_taco_strategy_config, load_config
+from _config import get_ntaco_strategy_config, load_config
 from sync_alpha_daily_to_sqlite import DEFAULT_DB_PATH as DEFAULT_PRICE_DB
 from sync_taco_data import load_taco_rows
-from taco_strategy import calculate_taco_jin10_signal, load_jin10_messages
+from taco_strategy import calculate_ntaco_signal
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_OUTPUT_DIR = ROOT_DIR / "data" / "backtests" / "taco_jin10_qqq"
+DEFAULT_OUTPUT_DIR = ROOT_DIR / "data" / "backtests" / "ntaco_qqq_100_20"
 
 
 def _metrics(returns: List[float], exposures: List[float]) -> Dict[str, float | int]:
@@ -87,48 +88,45 @@ def run_backtest_rows(
     *,
     price_rows: Iterable[Mapping[str, Any]],
     taco_rows: Iterable[Mapping[str, Any]],
-    jin10_rows: Iterable[Mapping[str, Any]],
     start_date: str,
     end_date: str,
     strategy_config: Mapping[str, Any],
 ) -> Dict[str, Any]:
     prices = sorted((dict(row) for row in price_rows), key=lambda row: str(row["date"]))
     tacos = [dict(row) for row in taco_rows]
-    messages = [dict(row) for row in jin10_rows]
     if len(prices) < 2:
         raise ValueError("At least two QQQ price rows are required")
 
     targets: Dict[str, float] = {}
     signals: Dict[str, Dict[str, Any]] = {}
+    prior_target = 0.0
     for row in prices:
         trade_date = str(row["date"])
         try:
-            signal = calculate_taco_jin10_signal(
+            signal = calculate_ntaco_signal(
                 tacos,
-                messages,
                 execution_date=trade_date,
-                smoothing_days=int(strategy_config["smoothing_days"]),
-                news_half_life_days=int(strategy_config["news_half_life_days"]),
-                risk_beta=float(strategy_config["risk_beta"]),
-                relief_beta=float(strategy_config["relief_beta"]),
-                buy_threshold=float(strategy_config["buy_threshold"]),
+                prior_exposure=prior_target,
+                lower_threshold=float(strategy_config["lower_threshold"]),
+                upper_threshold=float(strategy_config["upper_threshold"]),
+                buy_exposure=float(strategy_config["buy_exposure"]),
+                sell_fraction=float(strategy_config["sell_fraction"]),
+                normalization_lookback=int(strategy_config["normalization_lookback"]),
                 max_data_age_days=int(strategy_config["max_data_age_days"]),
-                require_fresh_news=bool(strategy_config.get("require_fresh_news", False)),
             )
         except ValueError as exc:
             signal = {
                 "signal_date": None,
                 "raw_taco": None,
-                "smoothed_taco": None,
-                "risk_intensity": None,
-                "relief_intensity": None,
-                "combined_signal": None,
-                "exposure": 0.0,
-                "regime": "cash_data_unavailable",
+                "ntaco": None,
+                "exposure": prior_target,
+                "regime": "hold_data_unavailable",
+                "action": "hold",
                 "error": str(exc),
             }
         signals[trade_date] = signal
         targets[trade_date] = float(signal["exposure"])
+        prior_target = targets[trade_date]
 
     cost_rate = float(strategy_config.get("transaction_cost_bps", 10.0)) / 10_000.0
     daily: List[Dict[str, Any]] = []
@@ -174,10 +172,9 @@ def run_backtest_rows(
                 "signal_date": signal.get("signal_date"),
                 "signal_error": signal.get("error"),
                 "raw_taco": signal.get("raw_taco"),
-                "smoothed_taco": signal.get("smoothed_taco"),
-                "risk_intensity": signal.get("risk_intensity"),
-                "relief_intensity": signal.get("relief_intensity"),
-                "combined_signal": signal.get("combined_signal"),
+                "ntaco": signal.get("ntaco"),
+                "regime": signal.get("regime"),
+                "signal_action": signal.get("action"),
                 "target_qqq": target,
                 "turnover": turnover,
                 "strategy_return": strategy_return,
@@ -217,12 +214,11 @@ def _write_outputs(result: Mapping[str, Any], output_dir: Path) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Backtest deployed TACO + Jin10 QQQ timing rule")
-    parser.add_argument("--start", default="2026-04-18")
-    parser.add_argument("--end", default="2026-06-17")
+    parser = argparse.ArgumentParser(description="Backtest deployed nTACO 100/20 QQQ timing rule")
+    parser.add_argument("--start", default="2025-02-19")
+    parser.add_argument("--end", default=date.today().isoformat())
     parser.add_argument("--price-db", default=str(DEFAULT_PRICE_DB))
     parser.add_argument("--taco-db", default="")
-    parser.add_argument("--jin10-db", default="")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     return parser
 
@@ -230,18 +226,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     config = load_config()
-    strategy = get_taco_strategy_config(config)
+    strategy = get_ntaco_strategy_config(config)
     taco_db = Path(args.taco_db) if args.taco_db else ROOT_DIR / strategy["taco_db"]
-    jin10_db = Path(args.jin10_db) if args.jin10_db else ROOT_DIR / strategy["jin10_db"]
     result = run_backtest_rows(
         price_rows=load_price_rows(Path(args.price_db), strategy["symbol"]),
         taco_rows=load_taco_rows(taco_db),
-        jin10_rows=load_jin10_messages(
-            jin10_db,
-            start_date=args.start,
-            end_date_inclusive=args.end,
-            channel=strategy["jin10_channel"],
-        ),
         start_date=args.start,
         end_date=args.end,
         strategy_config=strategy,

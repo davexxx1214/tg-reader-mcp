@@ -129,40 +129,37 @@ Telegram ToS：[telegram.org/tos](https://telegram.org/tos) · API ToS：[core.t
 
 [@runesgangalpha](https://t.me/runesgangalpha) — 我的公开频道，用的就是这个 MCP 在做 Polymarket / AI / Crypto 信号的读取和消化，算是这个工作流的活样本。
 
-## 当前默认策略：TACO + 金十bot QQQ 择时
+## 当前默认策略：nTACO 100/20 QQQ 仓位策略
 
-默认交易流水线现在只交易 `QQQ`，策略状态只有两种：100% QQQ 或 100% 现金。不再使用旧股票池、基本面、Polymarket 或按 ticker 的 Telegram 新闻评分。
+默认交易流水线只交易 `QQQ`。六个 TACO 因子分别与严格此前最多42个观测做百分位归一化，再按发布权重合成为0—100的 nTACO。
 
 ```text
-signal = 3日平滑TACO - 3.0 * 金十风险新闻强度 + 5.0 * 金十缓和新闻强度
-
-signal <= -4.0  -> 持有 QQQ
-signal >  -4.0  -> 空仓
+nTACO >= 49%  -> 目标100% QQQ
+nTACO <= 30%  -> 最多减至80% QQQ（不会从现金反向买入）
+30%—49%       -> 保持上一目标仓位
 ```
 
-信号始终使用执行日前一个已完成数据日，避免未来函数。默认无杠杆、不做空，交易成本按 10bps 进入回测。
+信号始终只使用执行日之前已完成的数据，避免前视。默认无杠杆、不做空，交易成本按单边5bps进入回测。金十新闻不再参与本策略。
 
 ### 数据下载
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\sync_taco_data.py
-.\.venv\Scripts\python.exe scripts\collect_jin10_messages.py backfill --start 2026-04-18 --end 2026-06-17
-.\.venv\Scripts\python.exe scripts\collect_jin10_messages.py incremental --limit 500
 .\.venv\Scripts\python.exe scripts\sync_alpha_daily_to_sqlite.py --symbols QQQ
 ```
 
 ### 回测
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\backtest_taco_jin10_qqq.py --start 2026-04-18 --end 2026-06-17
+.\.venv\Scripts\python.exe scripts\backtest_ntaco_qqq.py --start 2025-02-19
 ```
 
-结果写入 `data/backtests/taco_jin10_qqq/summary.json` 和 `daily.tsv`。
+结果写入 `data/backtests/ntaco_qqq_100_20/summary.json` 和 `daily.tsv`。
 
 ### 交易流水线
 
 ```powershell
-# 默认 dry-run：同步三类数据并生成 QQQ 调仓计划
+# 默认 dry-run：同步 TACO 与 QQQ 数据并生成调仓计划
 .\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --skip-account-refresh
 
 # 使用已下载数据做确定性 dry-run

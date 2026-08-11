@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""TACO + Jin10 QQQ-only timing strategy.
+"""Causal normalized-TACO 100/20 position strategy for QQQ only.
 
-The deployed rule is intentionally binary: hold 100% QQQ when the lagged
-combined signal is at or below the buy threshold, otherwise hold cash.
+Each factor is ranked against its own strictly-prior 42-observation history.
+The published factor weights then produce nTACO on a 0..100 scale. A high
+signal targets 100% QQQ; a low signal caps exposure at 80% and never buys from
+cash. Values between the thresholds preserve the prior target exposure.
 """
 
 from __future__ import annotations
@@ -11,59 +13,29 @@ import html as html_lib
 import json
 import math
 import re
-import sqlite3
-from collections import defaultdict
-from datetime import date, datetime
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from datetime import date
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 import requests
 
 
 DEFAULT_DASHBOARD_URL = "https://ocmacro.com/dashboard/trump"
 DEFAULT_SYMBOL = "QQQ"
-
-RISK_TERMS: Dict[str, float] = {
-    "关税": 1.5,
-    "制裁": 1.2,
-    "战争": 1.5,
-    "冲突": 1.2,
-    "袭击": 1.3,
-    "打击": 1.2,
-    "威胁": 1.0,
-    "霍尔木兹": 1.5,
-    "伊朗": 0.8,
-    "以色列": 0.8,
-    "油价": 0.8,
-    "原油": 0.5,
-    "通胀": 0.8,
-    "CPI": 0.8,
-    "鲍威尔": 0.7,
-    "美联储": 0.7,
-    "收益率": 0.6,
-    "加息": 0.9,
-    "爆发": 1.2,
-    "破裂": 1.2,
-    "拒绝": 0.8,
+FACTOR_WEIGHTS: Dict[str, float] = {
+    "approval": 0.25,
+    "dgs10": 0.15,
+    "move": 0.10,
+    "sp500": 0.15,
+    "vix": 0.10,
+    "cpi_nowcast": 0.25,
 }
-
-RELIEF_TERMS: Dict[str, float] = {
-    "停火": 1.5,
-    "暂停": 1.2,
-    "延期": 1.2,
-    "豁免": 1.3,
-    "谈判": 1.0,
-    "达成": 1.1,
-    "缓和": 1.2,
-    "撤回": 1.2,
-    "降级": 1.0,
-    "同意": 0.8,
-    "接触": 0.8,
-    "恢复": 0.8,
-    "协议": 1.0,
-    "和平": 1.0,
-    "斡旋": 1.0,
-    "取消": 1.0,
+FACTOR_SOURCE_KEYS: Dict[str, Sequence[str]] = {
+    "approval": ("approval",),
+    "dgs10": ("dgs10",),
+    "move": ("move",),
+    "sp500": ("sp500",),
+    "vix": ("vix",),
+    "cpi_nowcast": ("cpi_nowcast", "bkevenpy02"),
 }
 
 
@@ -144,10 +116,14 @@ def parse_taco_dashboard(page_html: str) -> List[Dict[str, Any]]:
     unique: Dict[str, Dict[str, Any]] = {}
     for point in points:
         trade_date = str(point["date"])
+        contributions = point.get("contributions")
+        if not isinstance(contributions, dict):
+            raise ValueError(f"TACO factor contributions missing for {trade_date}")
         unique[trade_date] = {
             "date": trade_date,
             "value": _to_float(point.get("value")),
             "event_strength_score": _to_float(point.get("event_strength_score")),
+            "contributions": dict(contributions),
             "raw": point,
         }
     return [unique[key] for key in sorted(unique)]
@@ -173,190 +149,185 @@ def fetch_taco_dashboard(
     return parse_taco_dashboard(response.text)
 
 
-def _star_weight(text: str) -> float:
-    stars = text.count("★")
-    if stars <= 0:
-        return 0.6
-    if stars == 1:
-        return 0.8
-    return 1.0
+def _factor_pressures(row: Mapping[str, Any]) -> Dict[str, float]:
+    contributions = row.get("contributions")
+    if not isinstance(contributions, Mapping):
+        raw = row.get("raw")
+        contributions = raw.get("contributions") if isinstance(raw, Mapping) else None
+    if not isinstance(contributions, Mapping):
+        raise ValueError(f"TACO factor contributions missing for {row.get('date')}")
+
+    pressures: Dict[str, float] = {}
+    for factor, weight in FACTOR_WEIGHTS.items():
+        source_value = None
+        for source_key in FACTOR_SOURCE_KEYS[factor]:
+            if source_key in contributions:
+                source_value = contributions[source_key]
+                break
+        if source_value is None:
+            raise ValueError(f"TACO factor {factor} missing for {row.get('date')}")
+        numeric = float(source_value)
+        if not math.isfinite(numeric):
+            raise ValueError(f"TACO factor {factor} is non-finite for {row.get('date')}")
+        pressures[factor] = numeric / weight
+    return pressures
 
 
-def _weighted_term_score(text: str, terms: Mapping[str, float]) -> float:
-    return sum(float(weight) for term, weight in terms.items() if term in text)
-
-
-def score_jin10_message(text: str) -> Tuple[float, float]:
-    normalized = str(text or "")
-    weight = _star_weight(normalized)
-    return (
-        weight * _weighted_term_score(normalized, RISK_TERMS),
-        weight * _weighted_term_score(normalized, RELIEF_TERMS),
-    )
-
-
-def load_jin10_messages(
-    db_path: Path,
-    *,
-    start_date: Optional[str] = None,
-    end_date_inclusive: Optional[str] = None,
-    channel: str = "jinshishuju_bot",
-) -> List[Dict[str, Any]]:
-    if not Path(db_path).exists():
-        raise FileNotFoundError(f"Jin10 SQLite database not found: {db_path}")
-    clauses = ["channel = ?"]
-    params: List[Any] = [channel]
-    if start_date:
-        clauses.append("substr(date_hk, 1, 10) >= ?")
-        params.append(str(start_date))
-    if end_date_inclusive:
-        clauses.append("substr(date_hk, 1, 10) <= ?")
-        params.append(str(end_date_inclusive))
-    query = f"""
-        SELECT message_id, date_hk, text
-        FROM jin10_messages
-        WHERE {' AND '.join(clauses)}
-        ORDER BY message_id
-    """
-    conn = sqlite3.connect(str(db_path))
-    try:
-        rows = conn.execute(query, params).fetchall()
-    finally:
-        conn.close()
-    return [
-        {"message_id": int(row[0]), "date_hk": str(row[1]), "text": str(row[2] or "")}
-        for row in rows
-    ]
-
-
-def _daily_news_intensity(
-    messages: Iterable[Mapping[str, Any]],
-    *,
-    through_date: date,
-) -> Dict[date, Dict[str, float]]:
-    totals: Dict[date, Dict[str, float]] = defaultdict(
-        lambda: {"count": 0.0, "risk_sum": 0.0, "relief_sum": 0.0}
-    )
-    for message in messages:
-        message_date = _parse_date(message.get("date_hk") or message.get("date"))
-        if message_date > through_date:
-            continue
-        risk, relief = score_jin10_message(str(message.get("text") or ""))
-        totals[message_date]["count"] += 1.0
-        totals[message_date]["risk_sum"] += risk
-        totals[message_date]["relief_sum"] += relief
-
-    daily: Dict[date, Dict[str, float]] = {}
-    for message_date, values in totals.items():
-        count = max(values["count"], 1.0)
-        daily[message_date] = {
-            "count": values["count"],
-            "risk": values["risk_sum"] / count,
-            "relief": values["relief_sum"] / count,
-        }
-    return daily
-
-
-def _decayed_news_value(
-    daily: Mapping[date, Mapping[str, float]],
-    *,
-    key: str,
-    through_date: date,
-    half_life_days: int,
-) -> float:
-    decay = math.log(2.0) / max(int(half_life_days), 1)
-    total = 0.0
-    for message_date, values in daily.items():
-        age = max((through_date - message_date).days, 0)
-        total += _to_float(values.get(key)) * math.exp(-decay * age)
-    return total
-
-
-def calculate_taco_jin10_signal(
+def build_ntaco_rows(
     taco_rows: Iterable[Mapping[str, Any]],
-    jin10_rows: Iterable[Mapping[str, Any]],
+    *,
+    lookback: int = 42,
+) -> List[Dict[str, Any]]:
+    """Build nTACO with an expanding cold start and prior-only rolling window."""
+    ordered = sorted((dict(row) for row in taco_rows), key=lambda row: _parse_date(row.get("date")))
+    pressures = [_factor_pressures(row) for row in ordered]
+    output: List[Dict[str, Any]] = []
+    window_size = max(int(lookback), 1)
+    for index, row in enumerate(ordered):
+        history = pressures[max(0, index - window_size):index]
+        ntaco = None
+        factor_percentiles: Dict[str, float] = {}
+        if history:
+            for factor in FACTOR_WEIGHTS:
+                current = pressures[index][factor]
+                values = [item[factor] for item in history]
+                below = sum(value < current for value in values)
+                equal = sum(value == current for value in values)
+                factor_percentiles[factor] = 100.0 * (below + 0.5 * equal) / len(values)
+            ntaco = sum(
+                factor_percentiles[factor] * FACTOR_WEIGHTS[factor]
+                for factor in FACTOR_WEIGHTS
+            )
+        output.append(
+            {
+                "date": _parse_date(row.get("date")).isoformat(),
+                "raw_taco": _to_float(row.get("value")),
+                "ntaco": ntaco,
+                "factor_percentiles": factor_percentiles,
+            }
+        )
+    return output
+
+
+def _threshold_percent(value: float) -> float:
+    number = float(value)
+    return number * 100.0 if 0.0 <= number <= 1.0 else number
+
+
+def target_exposure_for_ntaco(
+    ntaco: float,
+    prior_exposure: float,
+    *,
+    lower_threshold: float = 0.30,
+    upper_threshold: float = 0.49,
+    buy_exposure: float = 1.0,
+    sell_fraction: float = 0.20,
+) -> tuple[float, str]:
+    lower = _threshold_percent(lower_threshold)
+    upper = _threshold_percent(upper_threshold)
+    if not 0.0 <= lower < upper <= 100.0:
+        raise ValueError("nTACO thresholds must satisfy 0 <= lower < upper <= 100")
+    previous = min(max(float(prior_exposure), 0.0), 1.0)
+    full_target = min(max(float(buy_exposure), 0.0), 1.0)
+    low_cap = min(max(1.0 - float(sell_fraction), 0.0), full_target)
+    value = float(ntaco)
+    if value >= upper:
+        return full_target, "raise_to_100" if previous < full_target else "hold_100"
+    if value <= lower:
+        target = min(previous, low_cap)
+        if target < previous:
+            return target, "trim_to_80"
+        if target == 0.0:
+            return target, "hold_cash"
+        return target, "hold_low"
+    return previous, "hold"
+
+
+def calculate_ntaco_signal(
+    taco_rows: Iterable[Mapping[str, Any]],
     *,
     execution_date: str,
-    smoothing_days: int = 3,
-    news_half_life_days: int = 2,
-    risk_beta: float = -3.0,
-    relief_beta: float = 5.0,
-    buy_threshold: float = -4.0,
+    prior_exposure: float,
+    lower_threshold: float = 0.30,
+    upper_threshold: float = 0.49,
+    buy_exposure: float = 1.0,
+    sell_fraction: float = 0.20,
+    normalization_lookback: int = 42,
     max_data_age_days: int = 7,
-    require_fresh_news: bool = False,
 ) -> Dict[str, Any]:
     execution_day = _parse_date(execution_date)
-    eligible = []
-    for row in taco_rows:
-        row_date = _parse_date(row.get("date"))
-        if row_date < execution_day:
-            eligible.append((row_date, _to_float(row.get("value"))))
-    eligible.sort(key=lambda item: item[0])
+    eligible = [dict(row) for row in taco_rows if _parse_date(row.get("date")) < execution_day]
+    eligible.sort(key=lambda row: _parse_date(row.get("date")))
     if not eligible:
         raise ValueError("No lagged TACO data is available before execution date")
-
-    signal_date, raw_taco = eligible[-1]
+    signal_date = _parse_date(eligible[-1].get("date"))
     data_age_days = (execution_day - signal_date).days
     if data_age_days > max(int(max_data_age_days), 0):
         raise ValueError(
             f"TACO data is stale: signal_date={signal_date.isoformat()} age_days={data_age_days}"
         )
 
-    window = eligible[-max(int(smoothing_days), 1):]
-    smoothed_taco = sum(value for _, value in window) / len(window)
-    daily_news = _daily_news_intensity(jin10_rows, through_date=signal_date)
-    latest_news_date = max(daily_news) if daily_news else None
-    news_age_days = (signal_date - latest_news_date).days if latest_news_date else None
-    if require_fresh_news:
-        if latest_news_date is None:
-            raise ValueError("No Jin10 data is available before the signal date")
-        if news_age_days is not None and news_age_days > max(int(max_data_age_days), 0):
-            raise ValueError(
-                f"Jin10 data is stale: latest_date={latest_news_date.isoformat()} age_days={news_age_days}"
-            )
-    risk_intensity = _decayed_news_value(
-        daily_news,
-        key="risk",
-        through_date=signal_date,
-        half_life_days=news_half_life_days,
+    normalized = build_ntaco_rows(eligible, lookback=normalization_lookback)
+    latest = normalized[-1]
+    if latest["ntaco"] is None:
+        raise ValueError("At least two prior TACO factor observations are required")
+    target, action = target_exposure_for_ntaco(
+        float(latest["ntaco"]),
+        prior_exposure,
+        lower_threshold=lower_threshold,
+        upper_threshold=upper_threshold,
+        buy_exposure=buy_exposure,
+        sell_fraction=sell_fraction,
     )
-    relief_intensity = _decayed_news_value(
-        daily_news,
-        key="relief",
-        through_date=signal_date,
-        half_life_days=news_half_life_days,
-    )
-    combined_signal = (
-        smoothed_taco
-        + float(risk_beta) * risk_intensity
-        + float(relief_beta) * relief_intensity
-    )
-    exposure = 1.0 if combined_signal <= float(buy_threshold) else 0.0
+    lower = _threshold_percent(lower_threshold)
+    upper = _threshold_percent(upper_threshold)
+    regime = "high" if float(latest["ntaco"]) >= upper else "low" if float(latest["ntaco"]) <= lower else "middle"
     return {
         "execution_date": execution_day.isoformat(),
         "signal_date": signal_date.isoformat(),
         "data_age_days": data_age_days,
-        "raw_taco": raw_taco,
-        "smoothed_taco": smoothed_taco,
-        "risk_intensity": risk_intensity,
-        "relief_intensity": relief_intensity,
-        "combined_signal": combined_signal,
-        "buy_threshold": float(buy_threshold),
-        "regime": "long_qqq" if exposure == 1.0 else "cash",
-        "exposure": exposure,
+        "raw_taco": latest["raw_taco"],
+        "ntaco": float(latest["ntaco"]),
+        "ntaco_pct": float(latest["ntaco"]) / 100.0,
+        "factor_percentiles": latest["factor_percentiles"],
+        "lower_threshold": float(lower_threshold),
+        "upper_threshold": float(upper_threshold),
+        "prior_exposure": float(prior_exposure),
+        "exposure": target,
+        "regime": regime,
+        "action": action,
         "taco_observations": len(eligible),
-        "jin10_messages": int(sum(item.get("count", 0.0) for item in daily_news.values())),
-        "latest_jin10_date": latest_news_date.isoformat() if latest_news_date else None,
-        "jin10_age_days": news_age_days,
+        "normalization_lookback": max(int(normalization_lookback), 1),
     }
 
 
 def target_weights_for_exposure(symbol: str, exposure: float) -> Dict[str, float]:
     normalized = str(symbol or DEFAULT_SYMBOL).upper().strip()
     exposure_value = float(exposure)
-    if exposure_value not in {0.0, 1.0}:
-        raise ValueError("QQQ timing exposure must be exactly 0 or 1")
-    return {normalized: 1.0} if exposure_value == 1.0 else {}
+    if not 0.0 <= exposure_value <= 1.0:
+        raise ValueError("QQQ timing exposure must be between 0 and 1")
+    return {normalized: exposure_value} if exposure_value > 0.0 else {}
+
+
+def current_symbol_exposure(
+    symbol: str,
+    *,
+    account: Mapping[str, Any],
+    positions: Iterable[Mapping[str, Any]],
+) -> float:
+    equity = _to_float(account.get("equity") or account.get("portfolio_value"))
+    if equity <= 0:
+        return 0.0
+    normalized = str(symbol).upper().strip()
+    market_value = 0.0
+    for position in positions:
+        if str(position.get("symbol", "")).upper().strip() != normalized:
+            continue
+        value = _to_float(position.get("market_value"))
+        if value == 0.0:
+            value = _to_float(position.get("qty")) * _to_float(position.get("current_price"))
+        market_value += max(value, 0.0)
+    return min(max(market_value / equity, 0.0), 1.0)
 
 
 def build_rebalance_plan(
@@ -390,7 +361,7 @@ def build_rebalance_plan(
         price = normalized_prices.get(symbol) or position_map.get(symbol, {}).get("current_price", 0.0)
         if price <= 0:
             raise ValueError(f"Missing valid price for {symbol}")
-        target_weight = max(_to_float(target_weights.get(symbol)), 0.0)
+        target_weight = min(max(_to_float(target_weights.get(symbol)), 0.0), 1.0)
         target_qty = math.floor((equity * target_weight) / price)
         delta_qty = target_qty - current_qty
         whole_qty = math.floor(abs(delta_qty) + 1e-9)
@@ -407,7 +378,7 @@ def build_rebalance_plan(
                 "current_qty": current_qty,
                 "target_qty": target_qty,
                 "target_weight": target_weight,
-                "reason": "taco_jin10_qqq_rebalance",
+                "reason": "ntaco_qqq_100_20_rebalance",
             }
         )
     return sorted(plan, key=lambda item: (item["action"] != "sell", item["symbol"]))

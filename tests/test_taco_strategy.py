@@ -8,97 +8,91 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from query_stock_prices import _fetch_alpaca_snapshots  # noqa: E402
-from _config import get_taco_strategy_config  # noqa: E402
-from run_analysis_trade_pipeline import _execute_trade_plan, _load_prices, validate_run_options  # noqa: E402
+from _config import get_ntaco_strategy_config  # noqa: E402
+from run_analysis_trade_pipeline import (  # noqa: E402
+    _execute_trade_plan,
+    _enforce_low_signal_no_buy,
+    _load_prices,
+    validate_run_options,
+)
 from taco_strategy import (  # noqa: E402
+    FACTOR_WEIGHTS,
     build_rebalance_plan,
-    calculate_taco_jin10_signal,
-    score_jin10_message,
+    calculate_ntaco_signal,
+    target_exposure_for_ntaco,
     target_weights_for_exposure,
 )
 
 
-class TacoJin10SignalTests(unittest.TestCase):
-    def test_config_defaults_match_deployed_strategy(self):
-        parsed = get_taco_strategy_config({})
+def taco_row(day: str, pressure: float):
+    contributions = {key: pressure * weight for key, weight in FACTOR_WEIGHTS.items()}
+    return {"date": day, "value": pressure, "contributions": contributions}
+
+
+class NormalizedTacoSignalTests(unittest.TestCase):
+    def test_config_defaults_match_100_buy_20_sell_strategy(self):
+        parsed = get_ntaco_strategy_config({})
         self.assertEqual(parsed["symbol"], "QQQ")
-        self.assertEqual(parsed["buy_threshold"], -4.0)
-        self.assertEqual(parsed["smoothing_days"], 3)
-        self.assertEqual(parsed["news_half_life_days"], 2)
-        self.assertEqual(parsed["risk_beta"], -3.0)
-        self.assertEqual(parsed["relief_beta"], 5.0)
-        self.assertTrue(parsed["require_fresh_news"])
+        self.assertEqual(parsed["lower_threshold"], 0.30)
+        self.assertEqual(parsed["upper_threshold"], 0.49)
+        self.assertEqual(parsed["buy_exposure"], 1.0)
+        self.assertEqual(parsed["sell_fraction"], 0.20)
+        self.assertEqual(parsed["normalization_lookback"], 42)
+        self.assertEqual(parsed["transaction_cost_bps"], 5.0)
+        self.assertNotIn("jin10_db", parsed)
 
-    def test_keyword_scoring_matches_research_weights(self):
-        risk, relief = score_jin10_message("★★ 美国宣布新关税，同时恢复谈判并讨论停火")
-        self.assertAlmostEqual(risk, 1.5)
-        self.assertAlmostEqual(relief, 3.3)
+    def test_legacy_strategy_parameters_do_not_leak_into_ntaco(self):
+        parsed = get_ntaco_strategy_config(
+            {"taco_strategy": {"buy_threshold": -4.0, "transaction_cost_bps": 10.0}}
+        )
+        self.assertEqual(parsed["lower_threshold"], 0.30)
+        self.assertEqual(parsed["upper_threshold"], 0.49)
+        self.assertEqual(parsed["transaction_cost_bps"], 5.0)
 
-    def test_signal_uses_only_dates_before_execution(self):
-        taco_rows = [
-            {"date": "2026-06-08", "value": -6.0},
-            {"date": "2026-06-09", "value": -5.0},
-            {"date": "2026-06-10", "value": -4.0},
-            {"date": "2026-06-11", "value": 100.0},
-        ]
-        jin10_rows = [
-            {"message_id": 1, "date_hk": "2026-06-10T09:00:00+08:00", "text": "美国宣布新关税"},
-            {"message_id": 2, "date_hk": "2026-06-11T09:00:00+08:00", "text": "达成停火协议"},
-        ]
-
-        result = calculate_taco_jin10_signal(
-            taco_rows,
-            jin10_rows,
+    def test_signal_uses_only_prior_rows_and_buys_100_percent(self):
+        result = calculate_ntaco_signal(
+            [
+                taco_row("2026-06-08", 1.0),
+                taco_row("2026-06-09", 2.0),
+                taco_row("2026-06-10", 3.0),
+                taco_row("2026-06-11", -100.0),
+            ],
             execution_date="2026-06-11",
-            smoothing_days=3,
-            news_half_life_days=2,
-            risk_beta=-3.0,
-            relief_beta=5.0,
-            buy_threshold=-4.0,
+            prior_exposure=0.8,
+            lower_threshold=0.30,
+            upper_threshold=0.49,
+            normalization_lookback=42,
             max_data_age_days=7,
         )
 
         self.assertEqual(result["signal_date"], "2026-06-10")
-        self.assertAlmostEqual(result["smoothed_taco"], -5.0)
-        self.assertAlmostEqual(result["risk_intensity"], 0.9)
-        self.assertAlmostEqual(result["relief_intensity"], 0.0)
-        self.assertAlmostEqual(result["combined_signal"], -7.7)
+        self.assertAlmostEqual(result["ntaco"], 100.0)
         self.assertEqual(result["exposure"], 1.0)
-        self.assertEqual(result["regime"], "long_qqq")
+        self.assertEqual(result["action"], "raise_to_100")
 
-    def test_signal_above_threshold_moves_to_cash(self):
-        result = calculate_taco_jin10_signal(
-            [
-                {"date": "2026-06-08", "value": 0.0},
-                {"date": "2026-06-09", "value": 0.0},
-                {"date": "2026-06-10", "value": 0.0},
-            ],
-            [],
-            execution_date="2026-06-11",
-            smoothing_days=3,
-            news_half_life_days=2,
-            risk_beta=-3.0,
-            relief_beta=5.0,
-            buy_threshold=-4.0,
-            max_data_age_days=7,
-        )
-        self.assertEqual(result["exposure"], 0.0)
-        self.assertEqual(result["regime"], "cash")
+    def test_low_signal_sells_only_20_percent_from_full_position(self):
+        self.assertEqual(target_exposure_for_ntaco(20.0, 1.0), (0.8, "trim_to_80"))
 
-    def test_stale_jin10_data_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "Jin10 data is stale"):
-            calculate_taco_jin10_signal(
-                [{"date": "2026-06-10", "value": -5.0}],
-                [{"message_id": 1, "date_hk": "2026-06-01T09:00:00+08:00", "text": "关税"}],
+    def test_low_signal_never_buys_from_cash(self):
+        self.assertEqual(target_exposure_for_ntaco(20.0, 0.0), (0.0, "hold_cash"))
+
+    def test_middle_band_holds_prior_target(self):
+        self.assertEqual(target_exposure_for_ntaco(40.0, 0.8), (0.8, "hold"))
+
+    def test_stale_taco_data_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "TACO data is stale"):
+            calculate_ntaco_signal(
+                [taco_row("2026-06-01", 1.0), taco_row("2026-06-02", 2.0)],
                 execution_date="2026-06-11",
+                prior_exposure=0.0,
                 max_data_age_days=3,
-                require_fresh_news=True,
             )
 
 
 class TacoAllocationTests(unittest.TestCase):
-    def test_target_weights_are_qqq_or_cash_only(self):
+    def test_target_weights_accept_80_and_100_percent_qqq(self):
         self.assertEqual(target_weights_for_exposure("QQQ", 1.0), {"QQQ": 1.0})
+        self.assertEqual(target_weights_for_exposure("QQQ", 0.8), {"QQQ": 0.8})
         self.assertEqual(target_weights_for_exposure("QQQ", 0.0), {})
 
     def test_rebalance_sells_other_assets_and_buys_qqq(self):
@@ -106,11 +100,11 @@ class TacoAllocationTests(unittest.TestCase):
             account={"equity": 100_000.0, "cash": 100_000.0},
             positions=[{"symbol": "NVDA", "qty": 20.0, "current_price": 100.0}],
             prices={"NVDA": 100.0, "QQQ": 500.0},
-            target_weights={"QQQ": 1.0},
+            target_weights={"QQQ": 0.8},
         )
         by_symbol = {(item["action"], item["symbol"]): item for item in plan}
         self.assertEqual(by_symbol[("sell", "NVDA")]["qty"], 20)
-        self.assertEqual(by_symbol[("buy", "QQQ")]["qty"], 200)
+        self.assertEqual(by_symbol[("buy", "QQQ")]["qty"], 160)
 
 
 class AlpacaSnapshotCompatibilityTests(unittest.TestCase):
@@ -133,6 +127,22 @@ class AlpacaSnapshotCompatibilityTests(unittest.TestCase):
 
 
 class PipelineSafetyTests(unittest.TestCase):
+    def test_low_signal_cannot_rebuy_after_manual_exit(self):
+        signal = {"regime": "low", "exposure": 0.8, "action": "trim_to_80"}
+        guarded = _enforce_low_signal_no_buy(signal, current_exposure=0.0)
+        self.assertEqual(guarded["exposure"], 0.0)
+        self.assertEqual(guarded["action"], "hold_low_no_buy")
+
+    def test_non_finite_factor_is_rejected(self):
+        bad = taco_row("2026-06-09", 1.0)
+        bad["contributions"]["vix"] = float("nan")
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            calculate_ntaco_signal(
+                [taco_row("2026-06-08", 0.0), bad],
+                execution_date="2026-06-10",
+                prior_exposure=1.0,
+            )
+
     def test_execution_rejects_stale_local_account_snapshot(self):
         with self.assertRaisesRegex(ValueError, "fresh Alpaca account snapshot"):
             validate_run_options(execute_trades=True, skip_account_refresh=True)
