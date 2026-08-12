@@ -27,7 +27,7 @@ alpaca:
   secret_key: "your_alpaca_secret_key"
   paper: true
 
-# nTACO 100%买入 / 20%卖出 QQQ-only 仓位策略
+# nTACO 100/20 暴露信号；symbol 保留给旧版 QQQ 回测
 ntaco_strategy:
   enabled: true
   dashboard_url: "https://ocmacro.com/dashboard/trump"
@@ -42,16 +42,15 @@ ntaco_strategy:
   max_data_age_days: 7
   transaction_cost_bps: 5.0
 
-# V4.6-R1 十股因子篮子；nTACO 只控制总暴露，不进入个股综合分
+# V4.6-R1 独立十股因子篮子；始终满仓等权，不读取 TACO/nTACO
 factor_portfolio:
   enabled: true
-  mode: ntaco_exposure_overlay
+  mode: v4_6_r1_top10
   parameter_mode: frozen
   research_id: v4_6_r1_0001
   factor_db: "data/fama_french_daily.sqlite"
   signal_input: "data/factor_signal_input.csv"
   signal_manifest: "data/factor_signal_input.manifest.json"
-  ntaco_signal_path: "data/taco_qqq_pipeline_latest.json"
   output_path: "data/factor_portfolio_latest.json"
   holdings: 10
   max_names_per_industry: 3
@@ -68,6 +67,21 @@ factor_portfolio:
     profitability: 0.10
     investment: 0.30
     momentum: 0.20
+
+# 独立交易契约；每月审阅篮子后填写 approved_target_sha256 才能执行
+factor_execution:
+  enabled: true
+  target_path: "data/factor_portfolio_latest.json"
+  approved_target_sha256: ""
+  state_path: "data/factor_execution_state.json"
+  state_key_path: "data/factor_execution_state.key"
+  journal_path: "data/factor_execution_journal.json"
+  maximum_target_age_days: 40
+  legacy_managed_symbols: []
+  preserve_unmanaged_positions: true
+  paper_only: true
+  # 10万美元 Paper 账户的硬上限；代码拒绝更高值且从不使用 buying_power
+  capital_allocation_usd: 100000
 
 # Polymarket - 不需要 API Key（公开 API）
 

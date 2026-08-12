@@ -11,14 +11,13 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from _config import get_factor_portfolio_config  # noqa: E402
+from _config import get_factor_execution_config, get_factor_portfolio_config  # noqa: E402
 from factor_portfolio import (  # noqa: E402
     DEFAULT_WEIGHTS,
     FactorPortfolioError,
     candidate_weight_grid,
     conservative_factor_cutoff,
     derive_raw_factors,
-    load_ntaco_decision,
     score_cross_section,
     select_factor_portfolio,
     validate_signal_manifest,
@@ -35,6 +34,24 @@ class FactorPortfolioConfigTests(unittest.TestCase):
         self.assertEqual(parsed["max_names_per_industry"], 3)
         self.assertEqual(parsed["factor_lag_months"], 2)
         self.assertEqual(parsed["allocation_method"], "equal_weight")
+        self.assertEqual(parsed["mode"], "v4_6_r1_top10")
+
+    def test_execution_contract_is_separate_and_paper_only(self):
+        parsed = get_factor_execution_config({})
+        self.assertTrue(parsed["enabled"])
+        self.assertTrue(parsed["paper_only"])
+        self.assertTrue(parsed["preserve_unmanaged_positions"])
+        self.assertEqual(parsed["state_path"], "data/factor_execution_state.json")
+        self.assertEqual(parsed["journal_path"], "data/factor_execution_journal.json")
+        self.assertEqual(parsed["maximum_target_age_days"], 40)
+        self.assertEqual(parsed["legacy_managed_symbols"], [])
+        self.assertEqual(parsed["capital_allocation_usd"], 100_000.0)
+
+    def test_execution_rejects_capital_above_paper_account_value(self):
+        with self.assertRaisesRegex(ValueError, "100000"):
+            get_factor_execution_config(
+                {"factor_execution": {"capital_allocation_usd": 100_000.01}}
+            )
 
     def test_frozen_mode_rejects_nonbaseline_weights(self):
         with self.assertRaises(ValueError):
@@ -106,10 +123,9 @@ class FactorPortfolioScoringTests(unittest.TestCase):
             holdings=10,
             max_names_per_industry=3,
             minimum_adv20_usd=1_000_000.0,
-            exposure=0.8,
         )
         self.assertEqual(len(selected), 10)
-        self.assertAlmostEqual(sum(row["target_weight"] for row in selected), 0.8)
+        self.assertAlmostEqual(sum(row["target_weight"] for row in selected), 1.0)
         industry_counts = {}
         for row in selected:
             industry_counts[row["ff_industry_12"]] = industry_counts.get(row["ff_industry_12"], 0) + 1
@@ -154,7 +170,7 @@ class FactorPortfolioScoringTests(unittest.TestCase):
         with self.assertRaises(FactorPortfolioError):
             score_cross_section(rows, DEFAULT_WEIGHTS)
 
-    def test_manifest_and_ntaco_artifacts_are_hashed_and_date_aligned(self):
+    def test_signal_manifest_artifacts_are_hashed_and_date_aligned(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             signal_path = root / "signals.csv"
@@ -192,23 +208,6 @@ class FactorPortfolioScoringTests(unittest.TestCase):
             )
             self.assertEqual(verified["signalSha256"], signal_hash)
 
-            ntaco_path = root / "ntaco.json"
-            ntaco_path.write_text(
-                json.dumps(
-                    {
-                        "mode": "dry_run",
-                        "signal": {
-                            "signal_date": "2026-07-30",
-                            "execution_date": "2026-07-31",
-                            "exposure": 0.8,
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            decision = load_ntaco_decision(ntaco_path, factor_decision_date="2026-07-31")
-            self.assertEqual(decision["exposure"], 0.8)
-            self.assertEqual(len(decision["artifactSha256"]), 64)
 
 
 class FamaFrenchParserTests(unittest.TestCase):

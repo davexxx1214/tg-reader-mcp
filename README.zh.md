@@ -129,47 +129,45 @@ Telegram ToS：[telegram.org/tos](https://telegram.org/tos) · API ToS：[core.t
 
 [@runesgangalpha](https://t.me/runesgangalpha) — 我的公开频道，用的就是这个 MCP 在做 Polymarket / AI / Crypto 信号的读取和消化，算是这个工作流的活样本。
 
-## 当前默认策略：nTACO 100/20 QQQ 仓位策略
+## 当前默认策略：V4.6-R1 十股因子组合
 
-默认交易流水线只交易 `QQQ`。六个 TACO 因子分别与严格此前最多42个观测做百分位归一化，再按发布权重合成为0—100的 nTACO。
+交易流水线运行独立的 V4.6-R1。每月读取经过独立审批的时点截面产物，从 S&P 500 中选择10只股票，每只目标权重为策略资金袖套的10%。
+
+Paper 账户的策略资金上限为10万美元。执行器只使用账户现金和策略自有多头资产，不使用 Alpaca buying power，不融资、不做空、不加杠杆。
+因子买单使用提交前现金校验的限价单，不用市价买单追价；现金不足就拒绝。每笔卖单提交前也会重新核对当前多头数量，禁止超卖形成空头。
 
 ```text
-nTACO >= 49%  -> 目标100% QQQ
-nTACO <= 30%  -> 最多减至80% QQQ（不会从现金反向买入）
-30%—49%       -> 保持上一目标仓位
+五项个股信号 -> 对合格的 S&P 500 股票排序
+行业上限     -> 每个 FF12 行业最多3只
+最终组合     -> 10只 × 10%，总权重100%
 ```
 
-信号始终只使用执行日之前已完成的数据，避免前视。默认无杠杆、不做空，交易成本按单边5bps进入回测。金十新闻不再参与本策略。
+TACO/nTACO 不是选股因子、仓位覆盖层或执行依赖。旧 TACO 同步和 QQQ 回测脚本仅作为独立历史研究工具保留。
 
-### 数据下载
+### 生成并审批月度篮子
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\sync_taco_data.py
-.\.venv\Scripts\python.exe scripts\sync_alpha_daily_to_sqlite.py --symbols QQQ
+.\.venv\Scripts\python.exe scripts\sync_fama_french_factors.py
+.\.venv\Scripts\python.exe scripts\factor_portfolio.py
+(Get-FileHash data\factor_portfolio_latest.json -Algorithm SHA256).Hash.ToLower()
 ```
 
-### 回测
-
-```powershell
-.\.venv\Scripts\python.exe scripts\backtest_ntaco_qqq.py --start 2025-02-19
-```
-
-结果写入 `data/backtests/ntaco_qqq_100_20/summary.json` 和 `daily.tsv`。
+人工检查篮子后，将 SHA-256 填入 `factor_execution.approved_target_sha256`。目标缺失、被修改、来自未来或过期时，执行器都会停止。
 
 ### 交易流水线
 
 ```powershell
-# 默认 dry-run：同步 TACO 与 QQQ 数据并生成调仓计划
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --skip-account-refresh
+# 默认 dry-run：同步十股价格并生成调仓计划
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1
 
 # 使用已下载数据做确定性 dry-run
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --skip-data-sync --skip-account-refresh --signal-date 2026-06-17
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --skip-data-sync --skip-account-refresh --execution-date 2026-08-12
 
-# 实际提交订单：要求新鲜 Alpaca 账户快照
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --execute-trades
+# 提交 Alpaca Paper 订单：要求新鲜账户快照
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --execute-trades
 ```
 
-实际交易仍然是显式开启；默认不会提交订单。卖单优先执行，任何订单未达到 `filled` 状态时立即停止后续订单。
+订单仍然是显式开启，且默认仅限 Paper。流水线保留非本策略持仓，先写订单意图日志，策略自有卖单优先执行，任何订单未达到 `filled` 状态时立即停止。
 
 ## 集成：alpaca-live-trading skill（旧流程说明）
 
@@ -248,17 +246,19 @@ python scripts/query_fundamentals_sqlite.py --symbol BABA --quarters 8
 python scripts/query_prices_sqlite.py --symbols AAPL,NVDA --days 60
 ```
 
-### 运行 pipeline
+### V4.6-R1 执行
 
 ```bash
-# 仅分析（不下单）
-python scripts/run_analysis_trade_pipeline.py
+# 仅 dry-run（不下单）
+python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.6-r1
 
-# 分析 + 自动执行（受 market gate + risk guard 控制）
-python scripts/run_analysis_trade_pipeline.py --execute-trades
+# 显式提交 Alpaca Paper 订单
+python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --execute-trades
 ```
 
-`config.yaml` 配置：
+下面的 Telegram/新闻配置属于仓库其他旧组件，与 V4.6-R1 执行器相互独立。`run_analysis_trade_pipeline.py` 不接受 `--tg-news`，不使用 market gate，也不读取 TACO。
+
+保留给旧组件的 `config.yaml` 配置：
 
 ```yaml
 strategy:
@@ -272,7 +272,7 @@ market_gate:
   threshold: -0.05
 ```
 
-### 交易决策逻辑
+### 旧版交易决策逻辑
 
 1. **Round2 综合评分**：`fundamental_score`（50%）+ `technical_score`（30%）+ `news_score`（20%，带时效衰减）
 2. **通过规则**：保留 `score >= 0.4` 的标的，若无达标则回退 top-k
@@ -281,24 +281,11 @@ market_gate:
 5. **风控拦截**：拒绝 `exceed_max_trade_notional` / `exceed_max_position_pct` / `exceed_max_positions`
 6. **执行门控**：需要 `market_gate_score >= threshold` 且命令包含 `--execute-trades`
 
-### Telegram 新闻集成
+### Telegram 新闻集成（不属于 V4.6-R1）
 
 Pipeline 支持将 Telegram 新闻合并到 AlphaVantage 新闻流中。TG 消息通过关键词映射表（`scripts/tg_ticker_map.yaml`）匹配 ticker，用中文财经关键词词典打分，然后转化为与 AlphaVantage 相同的 article schema —— 现有的 `_compute_news_rank` 和 `_compute_round2_scores` 无需改动。
 
-**通过 `--tg-news` 启用：**
-
-```bash
-# 分析时加入金十bot新闻（默认频道）
-python scripts/run_analysis_trade_pipeline.py --tg-news
-
-# 自定义频道和条数
-python scripts/run_analysis_trade_pipeline.py --tg-news --tg-channels jinshishuju_bot --tg-limit 100
-
-# 调低 TG 权重（默认 0.8）
-python scripts/run_analysis_trade_pipeline.py --tg-news --tg-weight 0.6
-```
-
-**或在 `config.yaml` 中配置：**
+在 `config.yaml` 中配置旧版 Telegram 采集：
 
 ```yaml
 telegram:

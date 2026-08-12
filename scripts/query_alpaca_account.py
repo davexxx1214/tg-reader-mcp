@@ -339,6 +339,24 @@ def get_recent_orders(client: TradingClient, days: int = 7) -> List[Dict[str, An
     return result
 
 
+def get_open_orders(client: TradingClient) -> List[Dict[str, Any]]:
+    """Return every currently open order needed for ownership collision checks."""
+    request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+    orders = client.get_orders(filter=request)
+    return [
+        {
+            "id": str(order.id),
+            "client_order_id": str(getattr(order, "client_order_id", "") or ""),
+            "symbol": str(order.symbol).upper(),
+            "side": order.side.value if hasattr(order.side, "value") else str(order.side),
+            "qty": float(order.qty) if order.qty else 0.0,
+            "filled_qty": float(order.filled_qty) if order.filled_qty else 0.0,
+            "status": order.status.value if hasattr(order.status, "value") else str(order.status),
+        }
+        for order in orders
+    ]
+
+
 def format_currency(value: float) -> str:
     """格式化货币"""
     return f"${value:,.2f}"

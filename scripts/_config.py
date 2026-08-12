@@ -56,13 +56,12 @@ DEFAULT_NTACO_STRATEGY_CONFIG: Dict[str, Any] = {
 }
 DEFAULT_FACTOR_PORTFOLIO_CONFIG: Dict[str, Any] = {
     "enabled": True,
-    "mode": "ntaco_exposure_overlay",
+    "mode": "v4_6_r1_top10",
     "parameter_mode": "frozen",
     "research_id": "v4_6_r1_0001",
     "factor_db": "data/fama_french_daily.sqlite",
     "signal_input": "data/factor_signal_input.csv",
     "signal_manifest": "data/factor_signal_input.manifest.json",
-    "ntaco_signal_path": "data/taco_qqq_pipeline_latest.json",
     "output_path": "data/factor_portfolio_latest.json",
     "holdings": 10,
     "max_names_per_industry": 3,
@@ -81,6 +80,20 @@ DEFAULT_FACTOR_PORTFOLIO_CONFIG: Dict[str, Any] = {
         "momentum": 0.20,
     },
 }
+DEFAULT_FACTOR_EXECUTION_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "target_path": "data/factor_portfolio_latest.json",
+    "approved_target_sha256": "",
+    "state_path": "data/factor_execution_state.json",
+    "state_key_path": "data/factor_execution_state.key",
+    "journal_path": "data/factor_execution_journal.json",
+    "maximum_target_age_days": 40,
+    "legacy_managed_symbols": [],
+    "preserve_unmanaged_positions": True,
+    "paper_only": True,
+    "capital_allocation_usd": 100_000.0,
+}
+MAX_FACTOR_CAPITAL_USD = 100_000.0
 
 
 def load_config(config_path: Path = None) -> Dict[str, Any]:
@@ -252,7 +265,7 @@ def get_ntaco_strategy_config(config: Dict[str, Any] = None) -> Dict[str, Any]:
 
 
 def get_factor_portfolio_config(config: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Return validated V4.6-R1 stock-selection and TACO-overlay settings."""
+    """Return validated settings for the standalone V4.6-R1 stock selector."""
     if config is None:
         config = load_config()
     raw = config.get("factor_portfolio", {}) if isinstance(config, dict) else {}
@@ -291,8 +304,8 @@ def get_factor_portfolio_config(config: Dict[str, Any] = None) -> Dict[str, Any]
     if allocation != "equal_weight":
         raise ValueError("factor_portfolio only supports equal_weight allocation")
     mode = str(raw.get("mode", DEFAULT_FACTOR_PORTFOLIO_CONFIG["mode"]))
-    if mode != "ntaco_exposure_overlay":
-        raise ValueError("factor_portfolio only supports ntaco_exposure_overlay mode")
+    if mode != "v4_6_r1_top10":
+        raise ValueError("factor_portfolio only supports v4_6_r1_top10 mode")
     rebalance = str(raw.get("rebalance_frequency", "monthly"))
     if rebalance != "monthly":
         raise ValueError("factor_portfolio only supports monthly rebalancing")
@@ -308,7 +321,6 @@ def get_factor_portfolio_config(config: Dict[str, Any] = None) -> Dict[str, Any]
         "factor_db": str(raw.get("factor_db", DEFAULT_FACTOR_PORTFOLIO_CONFIG["factor_db"])),
         "signal_input": str(raw.get("signal_input", DEFAULT_FACTOR_PORTFOLIO_CONFIG["signal_input"])),
         "signal_manifest": str(raw.get("signal_manifest", DEFAULT_FACTOR_PORTFOLIO_CONFIG["signal_manifest"])),
-        "ntaco_signal_path": str(raw.get("ntaco_signal_path", DEFAULT_FACTOR_PORTFOLIO_CONFIG["ntaco_signal_path"])),
         "output_path": str(raw.get("output_path", DEFAULT_FACTOR_PORTFOLIO_CONFIG["output_path"])),
         "holdings": as_int("holdings"),
         "max_names_per_industry": as_int("max_names_per_industry"),
@@ -347,6 +359,61 @@ def get_factor_portfolio_config(config: Dict[str, Any] = None) -> Dict[str, Any]
         raise ValueError("research mode requires a new, non-baseline research_id")
     effective["baseline_deviations"] = deviations
     return effective
+
+
+def get_factor_execution_config(config: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Return the isolated broker-execution contract for the frozen factor basket."""
+    if config is None:
+        config = load_config()
+    raw = config.get("factor_execution", {}) if isinstance(config, dict) else {}
+    if not isinstance(raw, dict):
+        raise ValueError("factor_execution must be a mapping")
+    legacy = raw.get(
+        "legacy_managed_symbols", DEFAULT_FACTOR_EXECUTION_CONFIG["legacy_managed_symbols"]
+    )
+    if not isinstance(legacy, list):
+        raise ValueError("factor_execution.legacy_managed_symbols must be a list")
+    try:
+        maximum_age = int(
+            raw.get("maximum_target_age_days", DEFAULT_FACTOR_EXECUTION_CONFIG["maximum_target_age_days"])
+        )
+        capital = float(
+            raw.get("capital_allocation_usd", DEFAULT_FACTOR_EXECUTION_CONFIG["capital_allocation_usd"])
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("factor_execution numeric settings are invalid") from exc
+    approved_hash = str(raw.get("approved_target_sha256", "")).lower().strip()
+    if approved_hash and (
+        len(approved_hash) != 64
+        or any(character not in "0123456789abcdef" for character in approved_hash)
+    ):
+        raise ValueError("factor_execution.approved_target_sha256 must be a SHA-256")
+    result = {
+        "enabled": _to_bool(raw.get("enabled", True), True),
+        "target_path": str(raw.get("target_path", DEFAULT_FACTOR_EXECUTION_CONFIG["target_path"])),
+        "approved_target_sha256": approved_hash,
+        "state_path": str(raw.get("state_path", DEFAULT_FACTOR_EXECUTION_CONFIG["state_path"])),
+        "state_key_path": str(raw.get("state_key_path", DEFAULT_FACTOR_EXECUTION_CONFIG["state_key_path"])),
+        "journal_path": str(raw.get("journal_path", DEFAULT_FACTOR_EXECUTION_CONFIG["journal_path"])),
+        "maximum_target_age_days": maximum_age,
+        "legacy_managed_symbols": list(
+            dict.fromkeys(str(symbol).upper().strip() for symbol in legacy if str(symbol).strip())
+        ),
+        "preserve_unmanaged_positions": _to_bool(
+            raw.get("preserve_unmanaged_positions", True), True
+        ),
+        "paper_only": _to_bool(raw.get("paper_only", True), True),
+        "capital_allocation_usd": capital,
+    }
+    if maximum_age < 1 or capital <= 0.0:
+        raise ValueError("factor_execution limits must be positive")
+    if capital > MAX_FACTOR_CAPITAL_USD:
+        raise ValueError("factor_execution.capital_allocation_usd cannot exceed 100000")
+    if not result["preserve_unmanaged_positions"]:
+        raise ValueError("factor execution must preserve unmanaged account positions")
+    if not result["paper_only"]:
+        raise ValueError("V4.6-R1 factor execution is always Paper-only")
+    return result
 
 
 def get_risk_config(config: Dict[str, Any] = None) -> Dict[str, Any]:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the V4.6-R1 ten-stock factor basket and apply an nTACO exposure.
+"""Build the standalone, fully invested V4.6-R1 ten-stock factor basket.
 
 This is a portable, standard-library adaptation of the frozen factor-model
 ranking and selection rules. It does not fetch fundamentals or place orders.
@@ -126,37 +126,6 @@ def validate_signal_manifest(
         "manifestSha256": _file_sha256(manifest_path),
         "signalSha256": actual_signal_hash,
         "sourceSnapshots": normalized,
-    }
-
-
-def load_ntaco_decision(path: Path, *, factor_decision_date: str) -> dict[str, Any]:
-    """Load a dated nTACO dry-run/live decision artifact, failing closed."""
-    if not path.is_file():
-        raise FactorPortfolioError(f"nTACO decision artifact does not exist: {path}")
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise FactorPortfolioError("nTACO decision artifact is invalid JSON") from exc
-    if not isinstance(document, dict) or document.get("mode") not in {"dry_run", "live"}:
-        raise FactorPortfolioError("nTACO artifact mode must be dry_run or live")
-    signal = document.get("signal")
-    if not isinstance(signal, dict):
-        raise FactorPortfolioError("nTACO artifact has no signal object")
-    signal_date = _iso_date(signal.get("signal_date"), "nTACO signal_date")
-    execution_date = _iso_date(signal.get("execution_date"), "nTACO execution_date")
-    factor_date = _iso_date(factor_decision_date, "factor decision_date")
-    if signal_date >= execution_date or factor_date != execution_date:
-        raise FactorPortfolioError("nTACO signal and factor decision dates are not causally aligned")
-    exposure = _number(signal.get("exposure"))
-    if exposure not in {0.0, 0.8, 1.0}:
-        raise FactorPortfolioError("nTACO exposure must be the frozen 0.0, 0.8, or 1.0 state")
-    return {
-        "path": str(path),
-        "artifactSha256": _file_sha256(path),
-        "mode": document["mode"],
-        "signalDate": signal_date.isoformat(),
-        "executionDate": execution_date.isoformat(),
-        "exposure": exposure,
     }
 
 
@@ -453,13 +422,10 @@ def select_factor_portfolio(
     holdings: int = 10,
     max_names_per_industry: int = 3,
     minimum_adv20_usd: float = 0.0,
-    exposure: float = 1.0,
 ) -> list[dict[str, Any]]:
     """Select the diversified top names and assign equal target weights."""
     if holdings < 1 or max_names_per_industry < 1:
         raise FactorPortfolioError("portfolio limits must be positive")
-    if not 0.0 <= exposure <= 1.0:
-        raise FactorPortfolioError("exposure must be between 0 and 1")
     eligible = [
         dict(row)
         for row in rows
@@ -480,7 +446,7 @@ def select_factor_portfolio(
             break
     if len(selected) != holdings:
         raise FactorPortfolioError(f"only {len(selected)} diversified eligible names; need {holdings}")
-    target_weight = exposure / holdings
+    target_weight = 1.0 / holdings
     for rank, row in enumerate(selected, 1):
         row["selection_rank"] = rank
         row["target_weight"] = target_weight
@@ -506,8 +472,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", default="", help="Point-in-time signal CSV")
     parser.add_argument("--output", default="", help="Output JSON path")
     parser.add_argument("--manifest", default="", help="Signal provenance manifest JSON")
-    parser.add_argument("--ntaco-signal", default="", help="Dated nTACO decision JSON")
-    parser.add_argument("--exposure", type=float, default=None, help="Research-mode override only")
     parser.add_argument("--weights", default="", help="size=.1,value=.3,...")
     parser.add_argument("--list-candidates", action="store_true")
     return parser
@@ -519,8 +483,8 @@ def main() -> None:
         print(json.dumps(candidate_weight_grid([0.1, 0.2, 0.3], fundamental_sum=0.8, momentum=0.2), indent=2))
         return
     config = get_factor_portfolio_config(load_config())
-    if not config["enabled"] or config["mode"] != "ntaco_exposure_overlay":
-        raise FactorPortfolioError("factor portfolio must be enabled in ntaco_exposure_overlay mode")
+    if not config["enabled"] or config["mode"] != "v4_6_r1_top10":
+        raise FactorPortfolioError("factor portfolio must be enabled in v4_6_r1_top10 mode")
     input_path = Path(args.input or config["signal_input"])
     output_path = Path(args.output or config["output_path"])
     weights = _parse_weights(args.weights) if args.weights else config["weights"]
@@ -539,17 +503,6 @@ def main() -> None:
         membership_date=scored[0]["membership_date"],
         decision_date=scored[0]["decision_date"],
     )
-    if args.exposure is not None:
-        if config["parameter_mode"] != "research":
-            raise FactorPortfolioError("manual --exposure is forbidden in frozen mode")
-        exposure = args.exposure
-        ntaco = {"mode": "research_override", "exposure": exposure}
-    else:
-        ntaco = load_ntaco_decision(
-            Path(args.ntaco_signal or config["ntaco_signal_path"]),
-            factor_decision_date=scored[0]["decision_date"],
-        )
-        exposure = ntaco["exposure"]
     risk_audit = risk_factor_audit(
         Path(config["factor_db"]),
         decision_date=scored[0]["decision_date"],
@@ -560,7 +513,6 @@ def main() -> None:
         holdings=config["holdings"],
         max_names_per_industry=config["max_names_per_industry"],
         minimum_adv20_usd=config["minimum_adv20_usd"],
-        exposure=exposure,
     )
     effective_config = {
         key: config[key]
@@ -575,23 +527,20 @@ def main() -> None:
     ).hexdigest()
     payload = {
         "method": (
-            "v4_6_r1_factor_selection_with_ntaco_exposure_overlay"
+            "v4_6_r1_factor_selection"
             if config["parameter_mode"] == "frozen"
-            else "factor_selection_research_candidate_with_ntaco_overlay"
+            else "factor_selection_research_candidate"
         ),
         "research_id": config["research_id"],
         "parameter_mode": config["parameter_mode"],
         "membership_date": scored[0]["membership_date"],
         "decision_date": scored[0]["decision_date"],
         "allocation_method": "equal_weight",
-        "exposure": exposure,
-        "cash_weight": 1.0 - exposure,
         "weights": weights,
         "effective_config": effective_config,
         "effective_config_sha256": config_hash,
         "baseline_deviations": config["baseline_deviations"],
         "signal_manifest": manifest,
-        "ntaco_decision": ntaco,
         "risk_factor_audit": risk_audit,
         "selected": selected,
     }

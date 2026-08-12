@@ -129,47 +129,45 @@ Telegram ToS: [telegram.org/tos](https://telegram.org/tos) · API ToS: [core.tel
 
 Follow [@runesgangalpha](https://t.me/runesgangalpha) — my public channel where I use this exact MCP to read and digest Polymarket, AI, and crypto signals. It's a live demo of the workflow.
 
-## Current default strategy: nTACO 100/20 QQQ sizing
+## Current default strategy: V4.6-R1 ten-stock factor portfolio
 
-The default trading pipeline trades only `QQQ`. Each of the six TACO factors is ranked against up to 42 strictly prior observations, then combined with the published weights into a 0–100 nTACO index.
+The trading pipeline runs the standalone V4.6-R1 portfolio. Each month it reads an independently approved point-in-time artifact containing 10 S&P 500 stocks and targets 10% of the strategy sleeve in each name.
+
+The Paper account strategy budget is capped at $100,000. The executor uses only account cash plus strategy-owned long positions, never Alpaca buying power, margin, short sales, or leverage.
+Factor buys are cash-checked limit orders rather than market orders; an order is rejected instead of chasing price with borrowed funds. Sells are rechecked against the current long quantity immediately before submission.
 
 ```text
-nTACO >= 49%  -> target 100% QQQ
-nTACO <= 30%  -> cap exposure at 80% QQQ (never buy from cash)
-30%–49%       -> preserve the previous target exposure
+five stock-selection scores -> rank eligible S&P 500 names
+industry cap                -> at most 3 names per FF12 industry
+final portfolio             -> 10 stocks × 10%, total weight 100%
 ```
 
-The decision uses only data completed before the execution day. The strategy is long-only, uses no leverage, and applies 5bps one-way transaction costs in backtests. Jin10 news is no longer part of this strategy.
+TACO/nTACO is not an input, exposure overlay, or execution dependency. The old TACO sync and QQQ backtest scripts remain available only as independent legacy research tools.
 
-### Download data
+### Generate and approve the monthly basket
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\sync_taco_data.py
-.\.venv\Scripts\python.exe scripts\sync_alpha_daily_to_sqlite.py --symbols QQQ
+.\.venv\Scripts\python.exe scripts\sync_fama_french_factors.py
+.\.venv\Scripts\python.exe scripts\factor_portfolio.py
+(Get-FileHash data\factor_portfolio_latest.json -Algorithm SHA256).Hash.ToLower()
 ```
 
-### Backtest
-
-```powershell
-.\.venv\Scripts\python.exe scripts\backtest_ntaco_qqq.py --start 2025-02-19
-```
-
-Outputs are written to `data/backtests/ntaco_qqq_100_20/summary.json` and `daily.tsv`.
+After reviewing the target, copy its SHA-256 into `factor_execution.approved_target_sha256`. The executor refuses a missing, changed, future-dated, or stale artifact.
 
 ### Trading pipeline
 
 ```powershell
 # Dry-run with data refresh
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --skip-account-refresh
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1
 
 # Deterministic dry-run using existing local data
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --skip-data-sync --skip-account-refresh --signal-date 2026-06-17
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --skip-data-sync --skip-account-refresh --execution-date 2026-08-12
 
-# Explicit live execution with a fresh Alpaca account snapshot
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --execute-trades
+# Explicit Alpaca Paper execution with a fresh account snapshot
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --execute-trades
 ```
 
-Live orders remain opt-in. Sells execute first, and the pipeline stops immediately when any order is not `filled`.
+Orders remain opt-in and Paper-only by default. The pipeline preserves unmanaged holdings, journals order intents, sells strategy-owned exits first, and stops immediately when any order is not `filled`.
 
 ## Integration: alpaca-live-trading skill (legacy flow)
 
@@ -248,17 +246,19 @@ python scripts/query_fundamentals_sqlite.py --symbol BABA --quarters 8
 python scripts/query_prices_sqlite.py --symbols AAPL,NVDA --days 60
 ```
 
-### Running the pipeline
+### V4.6-R1 execution
 
 ```bash
-# Analysis only (no orders)
-python scripts/run_analysis_trade_pipeline.py
+# Dry-run only (no orders)
+python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.6-r1
 
-# Analysis + auto-execute (with market gate + risk guard)
-python scripts/run_analysis_trade_pipeline.py --execute-trades
+# Explicit Alpaca Paper execution
+python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --execute-trades
 ```
 
-Config in `config.yaml`:
+The legacy Telegram/news configuration below is independent of the V4.6-R1 executor. `run_analysis_trade_pipeline.py` does not accept `--tg-news`, apply a market gate, or read TACO.
+
+Legacy configuration retained for other repository components:
 
 ```yaml
 strategy:
@@ -272,7 +272,7 @@ market_gate:
   threshold: -0.05
 ```
 
-### Trade decision logic
+### Legacy trade decision logic
 
 1. **Round 2 scoring**: `fundamental_score` (50%) + `technical_score` (30%) + `news_score` (20%, with recency decay)
 2. **Pass rule**: keep candidates with `score >= 0.4`, fallback to top-k if none qualify
@@ -281,24 +281,11 @@ market_gate:
 5. **Risk guard**: rejects `exceed_max_trade_notional` / `exceed_max_position_pct` / `exceed_max_positions`
 6. **Execution gate**: requires `market_gate_score >= threshold` and `--execute-trades` flag
 
-### Telegram news integration
+### Telegram news integration (not part of V4.6-R1)
 
 The pipeline supports merging Telegram news into the AlphaVantage news stream. TG messages are matched to tickers via a keyword map (`scripts/tg_ticker_map.yaml`), scored using a Chinese financial keyword dictionary, then converted to the same article schema as AlphaVantage — so existing `_compute_news_rank` and `_compute_round2_scores` work unchanged.
 
-**Enable with `--tg-news`:**
-
-```bash
-# Analysis with TG news from 金十bot (default channel)
-python scripts/run_analysis_trade_pipeline.py --tg-news
-
-# Custom channels and limits
-python scripts/run_analysis_trade_pipeline.py --tg-news --tg-channels jinshishuju_bot --tg-limit 100
-
-# With lower TG weight (default 0.8)
-python scripts/run_analysis_trade_pipeline.py --tg-news --tg-weight 0.6
-```
-
-**Or configure in `config.yaml`:**
+Configure legacy Telegram ingestion in `config.yaml`:
 
 ```yaml
 telegram:

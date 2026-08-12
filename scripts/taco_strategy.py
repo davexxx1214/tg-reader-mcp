@@ -336,6 +336,7 @@ def build_rebalance_plan(
     positions: Iterable[Mapping[str, Any]],
     prices: Mapping[str, Any],
     target_weights: Mapping[str, Any],
+    fractional: bool = False,
 ) -> List[Dict[str, Any]]:
     equity = _to_float(account.get("equity") or account.get("portfolio_value"))
     if equity <= 0:
@@ -362,19 +363,20 @@ def build_rebalance_plan(
         if price <= 0:
             raise ValueError(f"Missing valid price for {symbol}")
         target_weight = min(max(_to_float(target_weights.get(symbol)), 0.0), 1.0)
-        target_qty = math.floor((equity * target_weight) / price)
+        raw_target_qty = (equity * target_weight) / price
+        target_qty = round(raw_target_qty, 6) if fractional else math.floor(raw_target_qty)
         delta_qty = target_qty - current_qty
-        whole_qty = math.floor(abs(delta_qty) + 1e-9)
-        if whole_qty <= 0:
+        order_qty = round(abs(delta_qty), 6) if fractional else math.floor(abs(delta_qty) + 1e-9)
+        if order_qty <= 0:
             continue
         action = "buy" if delta_qty > 0 else "sell"
         plan.append(
             {
                 "action": action,
                 "symbol": symbol,
-                "qty": whole_qty,
+                "qty": order_qty,
                 "price": price,
-                "estimated_notional": round(whole_qty * price, 2),
+                "estimated_notional": round(order_qty * price, 2),
                 "current_qty": current_qty,
                 "target_qty": target_qty,
                 "target_weight": target_weight,

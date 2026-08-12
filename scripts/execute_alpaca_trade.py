@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -127,7 +128,7 @@ def append_jsonl(jsonl_path: Path, row: Dict[str, Any]) -> None:
 def build_positions_from_alpaca(account, positions) -> Dict[str, Any]:
     raw = {"CASH": float(account.cash)}
     for pos in positions:
-        raw[pos.symbol] = int(float(pos.qty))
+        raw[pos.symbol] = float(pos.qty)
     return normalize_positions(raw)
 
 
@@ -164,21 +165,68 @@ def to_float_or_none(value: Any) -> Optional[float]:
         return None
 
 
+def validate_cash_long_only_order(
+    *,
+    action: str,
+    qty: float,
+    order_type: str,
+    limit_price: Optional[float],
+    cash: float,
+    current_long_qty: float,
+) -> None:
+    """Reject an order that could borrow cash or create/increase a short."""
+    if not math.isfinite(float(qty)) or float(qty) <= 0.0:
+        raise ValueError("order quantity must be finite and positive")
+    if action == "buy":
+        if (
+            order_type != "limit"
+            or limit_price is None
+            or not math.isfinite(float(limit_price))
+            or limit_price <= 0.0
+        ):
+            raise ValueError("cash-only buys require a positive limit price")
+        maximum_cost = float(qty) * float(limit_price)
+        available_cash = float(cash)
+        if not math.isfinite(available_cash) or maximum_cost > max(available_cash, 0.0) + 1e-6:
+            raise ValueError("cash-only buy exceeds current Alpaca cash")
+    elif action == "sell" and float(qty) > max(float(current_long_qty), 0.0) + 1e-6:
+        raise ValueError("long-only sell exceeds the current long position")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="执行/管理 Alpaca 交易并更新 position/balance")
     parser.add_argument("--action", choices=["buy", "sell"], help="交易动作")
     parser.add_argument("--symbol", help="股票代码，如 AAPL")
-    parser.add_argument("--qty", type=int, help="交易股数，正整数")
+    parser.add_argument("--qty", type=float, help="交易数量，支持碎股，必须为正数")
     parser.add_argument("--order-type", choices=["market", "limit"], default="market", help="订单类型")
     parser.add_argument("--limit-price", type=float, help="限价单价格（order-type=limit 时必填）")
     parser.add_argument("--wait-seconds", type=int, default=15, help="提交后轮询订单状态秒数，默认 15")
     parser.add_argument("--cancel-order-id", help="取消指定订单")
     parser.add_argument("--cancel-all-open", action="store_true", help="取消所有未完成订单")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
+    parser.add_argument("--client-order-id", help="幂等客户订单ID")
+    parser.add_argument(
+        "--require-paper",
+        action="store_true",
+        help="拒绝使用非 Alpaca Paper 凭证；供自动组合执行器使用",
+    )
+    parser.add_argument(
+        "--require-cash-only",
+        action="store_true",
+        help="买单必须为限价单，且最大成交额不得超过提交瞬间现金",
+    )
+    parser.add_argument(
+        "--require-long-only",
+        action="store_true",
+        help="卖单不得超过提交瞬间持有的多头数量",
+    )
     args = parser.parse_args()
 
     config = load_config()
     api_key, secret_key, paper = get_alpaca_credentials(config)
+    if args.require_paper and not paper:
+        print("❌ 此订单被限制为 Alpaca Paper Trading，当前配置为实盘", flush=True)
+        raise SystemExit(1)
     client = TradingClient(api_key, secret_key, paper=paper)
     # 订单管理操作
     if args.cancel_order_id:
@@ -231,7 +279,7 @@ def main() -> None:
         print("❌ --symbol 必填")
         raise SystemExit(1)
     if args.qty is None or args.qty <= 0:
-        print("❌ --qty 必须为正整数")
+        print("❌ --qty 必须为正数")
         raise SystemExit(1)
     if args.order_type == "limit" and (args.limit_price is None or args.limit_price <= 0):
         print("❌ 限价单必须提供有效的 --limit-price")
@@ -246,12 +294,34 @@ def main() -> None:
     symbol = args.symbol.upper()
     side = OrderSide.BUY if args.action == "buy" else OrderSide.SELL
 
+    if args.require_cash_only or args.require_long_only:
+        pre_account = client.get_account()
+        pre_positions = client.get_all_positions()
+        current_long_qty = 0.0
+        for position in pre_positions:
+            if str(position.symbol).upper() == symbol:
+                current_long_qty = max(float(position.qty), 0.0)
+                break
+        try:
+            validate_cash_long_only_order(
+                action=args.action,
+                qty=args.qty,
+                order_type=args.order_type,
+                limit_price=args.limit_price,
+                cash=float(pre_account.cash),
+                current_long_qty=current_long_qty,
+            )
+        except ValueError as exc:
+            print(f"❌ {exc}", flush=True)
+            raise SystemExit(1)
+
     if args.order_type == "market":
         order_request = MarketOrderRequest(
             symbol=symbol,
             qty=args.qty,
             side=side,
             time_in_force=TimeInForce.DAY,
+            client_order_id=args.client_order_id,
         )
     else:
         order_request = LimitOrderRequest(
@@ -260,6 +330,7 @@ def main() -> None:
             side=side,
             time_in_force=TimeInForce.DAY,
             limit_price=args.limit_price,
+            client_order_id=args.client_order_id,
         )
 
     order = client.submit_order(order_data=order_request)
@@ -276,6 +347,14 @@ def main() -> None:
     positions = client.get_all_positions()
     normalized_positions = build_positions_from_alpaca(account, positions)
     positions_details = build_positions_details(positions)
+    safety_violation = None
+    if args.require_cash_only and float(account.cash) < -0.01:
+        safety_violation = "post-trade cash is negative"
+    if args.require_long_only:
+        for position in positions:
+            if str(position.symbol).upper() == symbol and float(position.qty) < -1e-6:
+                safety_violation = "post-trade position is short"
+                break
 
     ts = get_dual_timestamps(order)
     filled_price = to_float_or_none(getattr(order, "filled_avg_price", None))
@@ -351,6 +430,7 @@ def main() -> None:
         "action": args.action,
         "symbol": symbol,
         "qty": args.qty,
+        "filled_qty": float(getattr(order, "filled_qty", 0.0) or 0.0),
         "order_type": args.order_type,
         "limit_price": limit_price,
         "filled_price": filled_price,
@@ -358,6 +438,7 @@ def main() -> None:
         "paper": bool(paper),
         "position_file": str(position_file),
         "balance_file": str(balance_file),
+        "safety_violation": safety_violation,
     }
 
     if args.json:
@@ -377,6 +458,8 @@ def main() -> None:
         print(f"  balance: {balance_file}")
 
     if current_status in {"canceled", "expired", "rejected"}:
+        raise SystemExit(1)
+    if safety_violation:
         raise SystemExit(1)
 
 

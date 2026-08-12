@@ -11,7 +11,6 @@ from query_stock_prices import _fetch_alpaca_snapshots  # noqa: E402
 from _config import get_ntaco_strategy_config  # noqa: E402
 from run_analysis_trade_pipeline import (  # noqa: E402
     _execute_trade_plan,
-    _enforce_low_signal_no_buy,
     _load_prices,
     validate_run_options,
 )
@@ -127,12 +126,6 @@ class AlpacaSnapshotCompatibilityTests(unittest.TestCase):
 
 
 class PipelineSafetyTests(unittest.TestCase):
-    def test_low_signal_cannot_rebuy_after_manual_exit(self):
-        signal = {"regime": "low", "exposure": 0.8, "action": "trim_to_80"}
-        guarded = _enforce_low_signal_no_buy(signal, current_exposure=0.0)
-        self.assertEqual(guarded["exposure"], 0.0)
-        self.assertEqual(guarded["action"], "hold_low_no_buy")
-
     def test_non_finite_factor_is_rejected(self):
         bad = taco_row("2026-06-09", 1.0)
         bad["contributions"]["vix"] = float("nan")
