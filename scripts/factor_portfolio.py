@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the standalone, fully invested V4.6-R1 ten-stock factor basket.
+"""Build a standalone, fully invested frozen ten-stock factor basket.
 
 This is a portable, standard-library adaptation of the frozen factor-model
 ranking and selection rules. It does not fetch fundamentals or place orders.
@@ -32,6 +32,80 @@ DEFAULT_WEIGHTS = {
     "investment": 0.30,
     "momentum": 0.20,
 }
+EFFECTIVE_CONFIG_KEYS = (
+    "holdings", "max_names_per_industry", "minimum_industry_count",
+    "minimum_adv20_usd", "winsor_lower", "winsor_upper", "factor_lag_months",
+    "allocation_method", "score_power", "minimum_weight", "maximum_weight",
+    "maximum_industry_weight", "rebalance_frequency", "weights",
+)
+
+
+def effective_factor_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the versioned selector/allocation fields bound into an artifact."""
+    return {key: config[key] for key in EFFECTIVE_CONFIG_KEYS}
+
+
+def effective_config_sha256(config: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(dict(config), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _serialized_artifact(payload: Mapping[str, Any]) -> bytes:
+    return (json.dumps(dict(payload), ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _atomic_write_artifact(path: Path, payload: Mapping[str, Any]) -> bytes:
+    raw = _serialized_artifact(payload)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(raw)
+    os.replace(temporary, path)
+    return raw
+
+
+def build_v46_predecessor_payload(
+    *,
+    config: Mapping[str, Any],
+    weights: Mapping[str, float],
+    membership_date: str,
+    decision_date: str,
+    manifest: Mapping[str, Any],
+    risk_audit: Mapping[str, Any],
+    selected: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build the immutable equal-weight membership anchor required by V4.7."""
+    rows = [dict(row) for row in selected]
+    if len(rows) != 10:
+        raise FactorPortfolioError("V4.6-R1 predecessor requires exactly ten stocks")
+    for row in rows:
+        row["target_weight"] = 0.1
+    effective = effective_factor_config(config)
+    effective.update(
+        {
+            "allocation_method": "equal_weight",
+            "score_power": 0.0,
+            "minimum_weight": 0.10,
+            "maximum_weight": 0.10,
+            "maximum_industry_weight": 0.30,
+        }
+    )
+    return {
+        "method": "v4_6_r1_factor_selection",
+        "research_id": "v4_6_r1_0001",
+        "parameter_mode": "frozen",
+        "membership_date": membership_date,
+        "decision_date": decision_date,
+        "allocation_method": "equal_weight",
+        "score_power": 0.0,
+        "weights": dict(weights),
+        "effective_config": effective,
+        "effective_config_sha256": effective_config_sha256(effective),
+        "baseline_deviations": {},
+        "signal_manifest": dict(manifest),
+        "risk_factor_audit": dict(risk_audit),
+        "selected": rows,
+    }
 REQUIRED_IDENTITY_COLUMNS = (
     "security_id",
     "ticker",
@@ -453,6 +527,104 @@ def select_factor_portfolio(
     return selected
 
 
+def allocate_score_tilt(
+    selected: Iterable[Mapping[str, Any]],
+    *,
+    power: float,
+    minimum_weight: float,
+    maximum_weight: float,
+    maximum_industry_weight: float,
+) -> list[dict[str, Any]]:
+    """Project score-power weights onto the frozen V4.7 linear constraints."""
+    rows = [dict(row) for row in selected]
+    if len(rows) != 10:
+        raise FactorPortfolioError("V4.7 requires exactly ten selected stocks")
+    scores = [_number(row.get("score")) for row in rows]
+    industries = [str(row.get("ff_industry_12", "")).strip() for row in rows]
+    if (
+        not math.isfinite(power)
+        or power <= 0.0
+        or any(score is None or score <= 0.0 for score in scores)
+        or any(not industry for industry in industries)
+        or not 0.0 < minimum_weight <= maximum_weight < 1.0
+        or 10 * minimum_weight > 1.0 + 1e-12
+        or 10 * maximum_weight < 1.0 - 1e-12
+        or not 0.0 < maximum_industry_weight <= 1.0
+    ):
+        raise FactorPortfolioError("V4.7 score-tilt inputs or constraints are invalid")
+
+    numeric_scores = [float(score) for score in scores]
+    log_raw = [power * math.log(score) for score in numeric_scores]
+    maximum_log = max(log_raw)
+    weights = [math.exp(value - maximum_log) for value in log_raw]
+    total = sum(weights)
+    weights = [value / total for value in weights]
+    score_order = sorted(range(10), key=lambda index: (-numeric_scores[index], index))
+    industry_groups = [
+        [index for index, value in enumerate(industries) if value == industry]
+        for industry in sorted(set(industries))
+    ]
+
+    projectors: list[tuple[str, Any]] = [("sum", list(range(10))), ("box", None)]
+    projectors.extend(
+        ("monotone", [left, right])
+        for left, right in zip(score_order, score_order[1:])
+    )
+    projectors.extend(("industry", group) for group in industry_groups)
+    corrections = [[0.0] * 10 for _ in projectors]
+
+    for _ in range(100_000):
+        cycle_start = list(weights)
+        for projector_index, (kind, indices) in enumerate(projectors):
+            shifted = [
+                weights[index] + corrections[projector_index][index]
+                for index in range(10)
+            ]
+            projected = list(shifted)
+            if kind == "sum":
+                adjustment = (1.0 - sum(shifted)) / 10.0
+                projected = [value + adjustment for value in shifted]
+            elif kind == "box":
+                projected = [
+                    min(max(value, minimum_weight), maximum_weight)
+                    for value in shifted
+                ]
+            elif kind == "monotone":
+                left, right = indices
+                if shifted[left] < shifted[right]:
+                    average = (shifted[left] + shifted[right]) / 2.0
+                    projected[left] = average
+                    projected[right] = average
+            elif kind == "industry":
+                excess = sum(shifted[index] for index in indices) - maximum_industry_weight
+                if excess > 0.0:
+                    adjustment = excess / len(indices)
+                    for index in indices:
+                        projected[index] = shifted[index] - adjustment
+            corrections[projector_index] = [
+                shifted[index] - projected[index] for index in range(10)
+            ]
+            weights = projected
+        if max(abs(weights[index] - cycle_start[index]) for index in range(10)) < 1e-13:
+            break
+    else:
+        raise FactorPortfolioError("V4.7 score-tilt projection did not converge")
+
+    industry_totals = [sum(weights[index] for index in group) for group in industry_groups]
+    ordered_weights = [weights[index] for index in score_order]
+    if (
+        abs(sum(weights) - 1.0) > 1e-8
+        or min(weights) < minimum_weight - 1e-8
+        or max(weights) > maximum_weight + 1e-8
+        or max(industry_totals) > maximum_industry_weight + 1e-8
+        or any(left < right - 1e-8 for left, right in zip(ordered_weights, ordered_weights[1:]))
+    ):
+        raise FactorPortfolioError("V4.7 score-tilt constraint certificate failed")
+    for row, weight in zip(rows, weights):
+        row["target_weight"] = float(weight)
+    return rows
+
+
 def load_signal_csv(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FactorPortfolioError(f"signal input does not exist: {path}")
@@ -468,7 +640,7 @@ def _parse_weights(value: str) -> dict[str, float]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build a V4.6-R1 ten-stock factor basket")
+    parser = argparse.ArgumentParser(description="Build a frozen ten-stock factor basket")
     parser.add_argument("--input", default="", help="Point-in-time signal CSV")
     parser.add_argument("--output", default="", help="Output JSON path")
     parser.add_argument("--manifest", default="", help="Signal provenance manifest JSON")
@@ -483,8 +655,8 @@ def main() -> None:
         print(json.dumps(candidate_weight_grid([0.1, 0.2, 0.3], fundamental_sum=0.8, momentum=0.2), indent=2))
         return
     config = get_factor_portfolio_config(load_config())
-    if not config["enabled"] or config["mode"] != "v4_6_r1_top10":
-        raise FactorPortfolioError("factor portfolio must be enabled in v4_6_r1_top10 mode")
+    if not config["enabled"]:
+        raise FactorPortfolioError("factor portfolio must be enabled")
     input_path = Path(args.input or config["signal_input"])
     output_path = Path(args.output or config["output_path"])
     weights = _parse_weights(args.weights) if args.weights else config["weights"]
@@ -514,28 +686,46 @@ def main() -> None:
         max_names_per_industry=config["max_names_per_industry"],
         minimum_adv20_usd=config["minimum_adv20_usd"],
     )
-    effective_config = {
-        key: config[key]
-        for key in (
-            "holdings", "max_names_per_industry", "minimum_industry_count",
-            "minimum_adv20_usd", "winsor_lower", "winsor_upper",
-            "factor_lag_months", "allocation_method", "rebalance_frequency", "weights",
+    predecessor_target = None
+    if config["allocation_method"] == "score_tilt" and config["parameter_mode"] == "frozen":
+        predecessor_payload = build_v46_predecessor_payload(
+            config=config,
+            weights=weights,
+            membership_date=scored[0]["membership_date"],
+            decision_date=scored[0]["decision_date"],
+            manifest=manifest,
+            risk_audit=risk_audit,
+            selected=selected,
         )
-    }
-    config_hash = hashlib.sha256(
-        json.dumps(effective_config, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+        predecessor_path = output_path.parent / (
+            "factor_portfolio_v4_6_r1_"
+            + scored[0]["decision_date"].replace("-", "")
+            + ".json"
+        )
+        predecessor_raw = _atomic_write_artifact(predecessor_path, predecessor_payload)
+        predecessor_target = {
+            "research_id": "v4_6_r1_0001",
+            "sha256": hashlib.sha256(predecessor_raw).hexdigest(),
+            "artifact_filename": predecessor_path.name,
+        }
+    if config["allocation_method"] == "score_tilt":
+        selected = allocate_score_tilt(
+            selected,
+            power=config["score_power"],
+            minimum_weight=config["minimum_weight"],
+            maximum_weight=config["maximum_weight"],
+            maximum_industry_weight=config["maximum_industry_weight"],
+        )
+    effective_config = effective_factor_config(config)
+    config_hash = effective_config_sha256(effective_config)
     payload = {
-        "method": (
-            "v4_6_r1_factor_selection"
-            if config["parameter_mode"] == "frozen"
-            else "factor_selection_research_candidate"
-        ),
+        "method": config["target_method"] if config["parameter_mode"] == "frozen" else "factor_selection_research_candidate",
         "research_id": config["research_id"],
         "parameter_mode": config["parameter_mode"],
         "membership_date": scored[0]["membership_date"],
         "decision_date": scored[0]["decision_date"],
-        "allocation_method": "equal_weight",
+        "allocation_method": config["allocation_method"],
+        "score_power": config["score_power"],
         "weights": weights,
         "effective_config": effective_config,
         "effective_config_sha256": config_hash,
@@ -544,10 +734,9 @@ def main() -> None:
         "risk_factor_audit": risk_audit,
         "selected": selected,
     }
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, output_path)
+    if predecessor_target is not None:
+        payload["predecessor_target"] = predecessor_target
+    _atomic_write_artifact(output_path, payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 

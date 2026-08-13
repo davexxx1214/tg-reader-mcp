@@ -55,7 +55,6 @@ DEFAULT_POSITION_SYMBOLS = [
 
 TERMINAL_ORDER_STATUSES = {
     "filled",
-    "partially_filled",
     "canceled",
     "expired",
     "rejected",

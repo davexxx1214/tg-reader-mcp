@@ -3,8 +3,10 @@ import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from unittest.mock import Mock
 
@@ -28,7 +30,33 @@ from run_analysis_trade_pipeline import (  # noqa: E402
     validate_factor_execution,
 )
 from taco_strategy import build_rebalance_plan  # noqa: E402
-from execute_alpaca_trade import validate_cash_long_only_order  # noqa: E402
+from execute_alpaca_trade import (  # noqa: E402
+    TERMINAL_ORDER_STATUSES,
+    validate_cash_long_only_order,
+)
+from factor_portfolio import allocate_score_tilt  # noqa: E402
+from reconcile_factor_execution_archive import reconcile_archive  # noqa: E402
+
+
+V47_EFFECTIVE_CONFIG = {
+    "holdings": 10,
+    "max_names_per_industry": 3,
+    "minimum_industry_count": 10,
+    "minimum_adv20_usd": 10_000_000.0,
+    "winsor_lower": 0.01,
+    "winsor_upper": 0.99,
+    "factor_lag_months": 2,
+    "allocation_method": "score_tilt",
+    "score_power": 6.0,
+    "minimum_weight": 0.05,
+    "maximum_weight": 0.20,
+    "maximum_industry_weight": 0.35,
+    "rebalance_frequency": "monthly",
+    "weights": {
+        "size": 0.10, "value": 0.30, "profitability": 0.10,
+        "investment": 0.30, "momentum": 0.20,
+    },
+}
 
 
 def factor_target(decision_date: str = "2026-07-31"):
@@ -45,7 +73,282 @@ def factor_target(decision_date: str = "2026-07-31"):
     }
 
 
+def v47_factor_target(decision_date: str = "2026-07-31", predecessor_hash: str = "a" * 64):
+    payload = factor_target(decision_date)
+    payload.update(
+        {
+            "method": "v4_7_factor_selection_score_tilt",
+            "research_id": "v4_7_0001",
+            "allocation_method": "score_tilt",
+            "score_power": 6.0,
+            "predecessor_target": {
+                "research_id": "v4_6_r1_0001",
+                "sha256": predecessor_hash,
+                "artifact_filename": "predecessor.json",
+            },
+            "effective_config": V47_EFFECTIVE_CONFIG,
+            "effective_config_sha256": hashlib.sha256(
+                json.dumps(V47_EFFECTIVE_CONFIG, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        }
+    )
+    for index, row in enumerate(payload["selected"]):
+        row.update(
+            {
+                "score": 1.0 - index * 0.05,
+                "ff_industry_12": f"I{index}",
+            }
+        )
+    tilted = allocate_score_tilt(
+        payload["selected"], power=6.0, minimum_weight=0.05,
+        maximum_weight=0.20, maximum_industry_weight=0.35,
+    )
+    payload["selected"] = tilted
+    return payload
+
+
+def write_v47_fixture(root: Path, payload: dict) -> Path:
+    predecessor = factor_target(payload["decision_date"])
+    predecessor["selected"] = [
+        {**row, "target_weight": 0.1}
+        for row in payload["selected"]
+    ]
+    predecessor_hash = hashlib.sha256(json.dumps(predecessor).encode()).hexdigest()
+    payload["predecessor_target"]["sha256"] = predecessor_hash
+    (root / "predecessor.json").write_text(json.dumps(predecessor), encoding="utf-8")
+    path = root / "target.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 class FactorBasketExecutionTests(unittest.TestCase):
+    def test_partial_fill_is_not_a_terminal_order_status(self):
+        self.assertNotIn("partially_filled", TERMINAL_ORDER_STATUSES)
+
+    def test_reconciliation_records_final_fill_and_retires_active_journal(self):
+        class FakeClient:
+            def get_account(self):
+                return SimpleNamespace(account_number="PAPER-ACCOUNT-1")
+
+            def get_order_by_client_id(self, client_id):
+                if client_id != "fv46-amzn":
+                    error = RuntimeError("not found")
+                    error.status_code = 404
+                    raise error
+                return SimpleNamespace(
+                    id="order-1", client_order_id=client_id, symbol="AMZN",
+                    side=SimpleNamespace(value="buy"), status=SimpleNamespace(value="filled"),
+                    qty="37.120903", filled_qty="37.120903",
+                    filled_avg_price="269.386767", limit_price="269.39",
+                )
+
+            def get_all_positions(self):
+                return [SimpleNamespace(symbol="AMZN", qty="37.120903")]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "data.zip"
+            output = root / "reconciled.zip"
+            prefix = "root/.hermes/skills/tg-reader-mcp/data/"
+            portfolio = factor_target("2026-08-12")
+            portfolio["selected"][0]["ticker"] = "AMZN"
+            portfolio["selected"][1]["ticker"] = "NVDA"
+            portfolio_bytes = json.dumps(portfolio).encode("utf-8")
+            target_hash = hashlib.sha256(portfolio_bytes).hexdigest()
+            journal = {
+                "schema_version": 1, "strategy": "v4_6_r1_top10", "status": "prepared",
+                "target_sha256": target_hash, "execution_date": "2026-08-12",
+                "orders": [
+                    {"action": "buy", "symbol": "AMZN", "qty": 37.120903,
+                     "client_order_id": "fv46-amzn"},
+                    {"action": "buy", "symbol": "NVDA", "qty": 10,
+                     "client_order_id": "fv46-nvda"},
+                ],
+            }
+            for index, order in enumerate(journal["orders"], 1):
+                intent = json.dumps(
+                    {
+                        "target": target_hash, "date": "2026-08-12", "index": index,
+                        "action": order["action"], "symbol": order["symbol"],
+                        "qty": order["qty"], "target_weight": order.get("target_weight"),
+                    },
+                    sort_keys=True, separators=(",", ":"),
+                )
+                key = hashlib.sha256(intent.encode("utf-8")).hexdigest()[:16]
+                order["client_order_id"] = (
+                    f"fv46-{key}-{index:02d}-{order['action'][0]}-{order['symbol']}"
+                )[:48]
+            submitted_client_id = journal["orders"][0]["client_order_id"]
+            FakeClient.get_order_by_client_id = lambda self, client_id: (
+                SimpleNamespace(
+                    id="order-1", client_order_id=client_id, symbol="AMZN",
+                    side=SimpleNamespace(value="buy"), status=SimpleNamespace(value="filled"),
+                    qty="37.120903", filled_qty="37.120903",
+                    filled_avg_price="269.386767", limit_price="269.39",
+                )
+                if client_id == submitted_client_id
+                else (_ for _ in ()).throw(type("NotFound", (RuntimeError,), {"status_code": 404})("not found"))
+            )
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr(prefix + "factor_portfolio_latest.json", portfolio_bytes)
+                archive.writestr(prefix + "factor_execution_journal.json", json.dumps(journal))
+                archive.writestr(prefix + "factor_execution_state.key", "a" * 64 + "\n")
+                archive.writestr(
+                    prefix + "balance/balance.jsonl",
+                    json.dumps({"account": {"account_number": "PAPER-ACCOUNT-1"}}) + "\n",
+                )
+            summary = reconcile_archive(source, output, client=FakeClient())
+            self.assertEqual(summary["owned_quantities"], {"AMZN": 37.120903})
+            with zipfile.ZipFile(output) as archive:
+                names = set(archive.namelist())
+                self.assertNotIn(prefix + "factor_execution_journal.json", names)
+                self.assertIn(prefix + "factor_execution_state.json", names)
+                self.assertTrue(any("journal.reconciled" in name for name in names))
+                state = json.loads(archive.read(prefix + "factor_execution_state.json"))
+            self.assertEqual(state["owned_quantities"], {"AMZN": 37.120903})
+            self.assertEqual(state["state_hmac_sha256"], _state_hmac(state, "a" * 64))
+
+            class WrongAccountClient(FakeClient):
+                def get_account(self):
+                    return SimpleNamespace(account_number="PAPER-ACCOUNT-2")
+
+            with self.assertRaisesRegex(RuntimeError, "account"):
+                reconcile_archive(
+                    source, root / "wrong-account.zip", client=WrongAccountClient()
+                )
+
+            duplicate = root / "duplicate.zip"
+            with zipfile.ZipFile(source) as source_archive, zipfile.ZipFile(duplicate, "w") as out:
+                for info in source_archive.infolist():
+                    if info.filename.endswith("/factor_execution_journal.json"):
+                        bad = dict(journal)
+                        bad["orders"] = [dict(journal["orders"][0]), dict(journal["orders"][0])]
+                        out.writestr(info, json.dumps(bad))
+                    else:
+                        out.writestr(info, source_archive.read(info.filename))
+            with self.assertRaisesRegex(RuntimeError, "duplicate"):
+                reconcile_archive(duplicate, root / "duplicate-output.zip", client=FakeClient())
+
+    def test_v47_reconciliation_starts_from_authenticated_v46_ownership(self):
+        state_key = "a" * 64
+        predecessor_hash = "b" * 64
+        portfolio = v47_factor_target("2026-08-12", predecessor_hash)
+        portfolio["selected"][0]["ticker"] = "AMZN"
+        portfolio["selected"][1]["ticker"] = "XOM"
+        portfolio_bytes = json.dumps(portfolio).encode("utf-8")
+        target_hash = hashlib.sha256(portfolio_bytes).hexdigest()
+        state = {
+            "schema_version": 1,
+            "strategy": "v4_6_r1_top10",
+            "owned_quantities": {"AMZN": 37.120903},
+            "target_artifact_sha256": predecessor_hash,
+            "target_decision_date": "2026-08-12",
+        }
+        state["state_hmac_sha256"] = _state_hmac(state, state_key)
+        orders = [
+            {"action": "sell", "symbol": "AMZN", "qty": 10.0, "target_weight": 0.20},
+            {"action": "buy", "symbol": "XOM", "qty": 5.0, "target_weight": 0.15},
+        ]
+        for index, order in enumerate(orders, 1):
+            intent = json.dumps(
+                {
+                    "target": target_hash,
+                    "date": "2026-08-12",
+                    "index": index,
+                    "action": order["action"],
+                    "symbol": order["symbol"],
+                    "qty": order["qty"],
+                    "target_weight": order["target_weight"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            key = hashlib.sha256(intent.encode("utf-8")).hexdigest()[:16]
+            order["client_order_id"] = (
+                f"fv47-{key}-{index:02d}-{order['action'][0]}-{order['symbol']}"
+            )[:48]
+        journal = {
+            "schema_version": 1,
+            "strategy": "v4_7_top10_score_tilt",
+            "status": "prepared",
+            "target_sha256": target_hash,
+            "target_artifact_filename": "factor_portfolio_v4_7_latest.json",
+            "target_method": "v4_7_factor_selection_score_tilt",
+            "execution_date": "2026-08-12",
+            "orders": orders,
+        }
+
+        class FakeClient:
+            def get_account(self):
+                return SimpleNamespace(account_number="PAPER-ACCOUNT-1")
+
+            def get_order_by_client_id(self, client_id):
+                order = next(item for item in orders if item["client_order_id"] == client_id)
+                return SimpleNamespace(
+                    id="broker-" + order["symbol"],
+                    client_order_id=client_id,
+                    symbol=order["symbol"],
+                    side=SimpleNamespace(value=order["action"]),
+                    status=SimpleNamespace(value="filled"),
+                    qty=str(order["qty"]),
+                    filled_qty=str(order["qty"]),
+                    filled_avg_price="100",
+                    limit_price="100",
+                )
+
+            def get_all_positions(self):
+                return [
+                    SimpleNamespace(symbol="AMZN", qty="27.120903"),
+                    SimpleNamespace(symbol="XOM", qty="5"),
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "v47.zip"
+            output = root / "v47-reconciled.zip"
+            prefix = "root/project/data/"
+            with zipfile.ZipFile(source, "w") as archive:
+                predecessor = factor_target("2026-08-12")
+                predecessor["selected"] = [
+                    {**row, "target_weight": 0.1} for row in portfolio["selected"]
+                ]
+                predecessor_bytes = json.dumps(predecessor).encode("utf-8")
+                predecessor_hash = hashlib.sha256(predecessor_bytes).hexdigest()
+                portfolio["predecessor_target"]["sha256"] = predecessor_hash
+                state["target_artifact_sha256"] = predecessor_hash
+                state["state_hmac_sha256"] = _state_hmac(state, state_key)
+                portfolio_bytes = json.dumps(portfolio).encode("utf-8")
+                target_hash = hashlib.sha256(portfolio_bytes).hexdigest()
+                journal["target_sha256"] = target_hash
+                for index, order in enumerate(orders, 1):
+                    intent = json.dumps(
+                        {
+                            "target": target_hash, "date": "2026-08-12", "index": index,
+                            "action": order["action"], "symbol": order["symbol"],
+                            "qty": order["qty"], "target_weight": order["target_weight"],
+                        }, sort_keys=True, separators=(",", ":"),
+                    )
+                    key = hashlib.sha256(intent.encode()).hexdigest()[:16]
+                    order["client_order_id"] = (
+                        f"fv47-{key}-{index:02d}-{order['action'][0]}-{order['symbol']}"
+                    )[:48]
+                archive.writestr(prefix + "factor_portfolio_v4_7_latest.json", portfolio_bytes)
+                archive.writestr(prefix + "factor_portfolio_v4_6_r1_20260812.json", predecessor_bytes)
+                archive.writestr(prefix + "factor_execution_journal.json", json.dumps(journal))
+                archive.writestr(prefix + "factor_execution_state.json", json.dumps(state))
+                archive.writestr(prefix + "factor_execution_state.key", state_key + "\n")
+                archive.writestr(
+                    prefix + "balance/balance.jsonl",
+                    json.dumps({"account": {"account_number": "PAPER-ACCOUNT-1"}}) + "\n",
+                )
+            summary = reconcile_archive(source, output, client=FakeClient())
+            self.assertEqual(summary["owned_quantities"], {"AMZN": 27.120903, "XOM": 5.0})
+            with zipfile.ZipFile(output) as archive:
+                reconciled_state = json.loads(
+                    archive.read(prefix + "factor_execution_state.json")
+                )
+            self.assertEqual(reconciled_state["strategy"], "v4_7_top10_score_tilt")
+
     def test_loads_frozen_monthly_basket_as_ten_equal_base_weights(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "target.json"
@@ -65,6 +368,115 @@ class FactorBasketExecutionTests(unittest.TestCase):
             basket["artifact_sha256"],
             expected_hash,
         )
+
+    def test_loads_v47_basket_with_frozen_score_tilt_weights(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_v47_fixture(Path(tmp), v47_factor_target())
+            approved_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            basket = _load_factor_basket(
+                path,
+                execution_date="2026-08-12",
+                expected_research_id="v4_7_0001",
+                expected_holdings=10,
+                maximum_age_days=40,
+                approved_sha256=approved_hash,
+                expected_method="v4_7_factor_selection_score_tilt",
+                expected_allocation_method="score_tilt",
+                expected_effective_config=V47_EFFECTIVE_CONFIG,
+            )
+        self.assertAlmostEqual(sum(basket["target_weights"].values()), 1.0)
+        self.assertTrue(basket["members_match_predecessor"])
+
+    def test_v47_basket_rejects_a_different_but_constraint_legal_tilt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = v47_factor_target()
+            path = write_v47_fixture(Path(tmp), payload)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["selected"][2]["target_weight"] -= 0.001
+            payload["selected"][3]["target_weight"] += 0.001
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "projection"):
+                _load_factor_basket(
+                    path, execution_date="2026-08-12", expected_research_id="v4_7_0001",
+                    expected_holdings=10, maximum_age_days=40,
+                    approved_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                    expected_method="v4_7_factor_selection_score_tilt",
+                    expected_allocation_method="score_tilt",
+                    expected_effective_config=V47_EFFECTIVE_CONFIG,
+                )
+
+    def test_v47_basket_rejects_effective_config_hash_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = v47_factor_target()
+            path = write_v47_fixture(Path(tmp), payload)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["effective_config"]["score_power"] = 4.0
+            payload["effective_config_sha256"] = hashlib.sha256(
+                json.dumps(payload["effective_config"], sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "effective config"):
+                _load_factor_basket(
+                    path, execution_date="2026-08-12", expected_research_id="v4_7_0001",
+                    expected_holdings=10, maximum_age_days=40,
+                    approved_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                    expected_method="v4_7_factor_selection_score_tilt",
+                    expected_allocation_method="score_tilt",
+                    expected_effective_config=V47_EFFECTIVE_CONFIG,
+                )
+
+    def test_v47_basket_rejects_nonfinite_scores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = v47_factor_target()
+            payload["selected"][0]["score"] = float("nan")
+            path = write_v47_fixture(Path(tmp), payload)
+            approved_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(RuntimeError, "score"):
+                _load_factor_basket(
+                    path,
+                    execution_date="2026-08-12",
+                    expected_research_id="v4_7_0001",
+                    expected_holdings=10,
+                    maximum_age_days=40,
+                    approved_sha256=approved_hash,
+                    expected_method="v4_7_factor_selection_score_tilt",
+                    expected_allocation_method="score_tilt",
+                    expected_effective_config=V47_EFFECTIVE_CONFIG,
+                )
+
+    def test_same_month_v47_upgrade_requires_exact_predecessor_hash(self):
+        prior_hash = "a" * 64
+        state = {
+            "strategy": "v4_6_r1_top10",
+            "target_decision_date": "2026-07-31",
+            "target_artifact_sha256": prior_hash,
+        }
+        basket = {
+            "research_id": "v4_7_0001",
+            "decision_date": "2026-07-31",
+            "artifact_sha256": "b" * 64,
+            "predecessor_target": {"research_id": "v4_6_r1_0001", "sha256": prior_hash},
+            "members_match_predecessor": True,
+        }
+        _validate_factor_target_transition(basket, state)
+        basket["predecessor_target"]["sha256"] = "c" * 64
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            _validate_factor_target_transition(basket, state)
+
+    def test_same_month_v47_upgrade_rejects_member_or_rank_changes(self):
+        prior_hash = "a" * 64
+        state = {
+            "strategy": "v4_6_r1_top10", "target_decision_date": "2026-07-31",
+            "target_artifact_sha256": prior_hash,
+        }
+        basket = {
+            "research_id": "v4_7_0001", "decision_date": "2026-07-31",
+            "artifact_sha256": "b" * 64,
+            "predecessor_target": {"research_id": "v4_6_r1_0001", "sha256": prior_hash},
+            "members_match_predecessor": False,
+        }
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            _validate_factor_target_transition(basket, state)
 
     def test_rejects_stale_factor_basket(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -363,14 +775,18 @@ class FactorBasketExecutionTests(unittest.TestCase):
             path = Path(tmp) / "journal.json"
             plan = [{"action": "buy", "symbol": "T01", "qty": 2}]
             first = _prepare_execution_journal(
-                path, plan, target_sha256="a" * 64, execution_date="2026-08-12"
+                path, plan, target_sha256="a" * 64, execution_date="2026-08-12",
+                target_artifact_path=Path("target.json"),
             )
             self.assertTrue(path.exists())
             self.assertTrue(first[0]["client_order_id"].startswith("fv46-"))
+            journal = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(journal["target_artifact_filename"], "target.json")
             first_id = first[0]["client_order_id"]
             with self.assertRaisesRegex(RuntimeError, "journal"):
                 _prepare_execution_journal(
-                    path, plan, target_sha256="a" * 64, execution_date="2026-08-12"
+                    path, plan, target_sha256="a" * 64, execution_date="2026-08-12",
+                    target_artifact_path=Path("target.json"),
                 )
             path.unlink()
             changed = _prepare_execution_journal(
@@ -378,6 +794,7 @@ class FactorBasketExecutionTests(unittest.TestCase):
                 [{"action": "buy", "symbol": "T01", "qty": 3}],
                 target_sha256="a" * 64,
                 execution_date="2026-08-12",
+                target_artifact_path=Path("target.json"),
             )
             self.assertNotEqual(first_id, changed[0]["client_order_id"])
 
@@ -441,6 +858,62 @@ class FactorBasketExecutionTests(unittest.TestCase):
         planned_symbols = {row["symbol"] for row in output["trade_plan"]}
         self.assertNotIn("QQQ", planned_symbols)
         self.assertNotIn("MANUAL", planned_symbols)
+
+    @patch("run_analysis_trade_pipeline._load_prices")
+    @patch("run_analysis_trade_pipeline._load_account")
+    def test_pipeline_uses_v47_tilted_target_weights(self, account_mock, prices_mock):
+        account_mock.return_value = (
+            {"equity": 100_000, "portfolio_value": 100_000, "cash": 100_000},
+            [],
+            {"status": "local_snapshot"},
+        )
+        prices_mock.return_value = {f"T{index:02d}": 100.0 for index in range(1, 11)}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_path = write_v47_fixture(root, v47_factor_target())
+            approved_hash = hashlib.sha256(target_path.read_bytes()).hexdigest()
+            args = Namespace(
+                strategy="factor-v4.7",
+                execute_trades=False,
+                skip_account_refresh=True,
+                skip_data_sync=True,
+                skip_price_sync=True,
+                av_calls_per_minute=75,
+                execution_date="2026-08-12",
+                output_file=str(root / "result.json"),
+            )
+            output, _ = _run_pipeline(
+                args,
+                config={"alpaca": {"paper": True, "secret_key": "secret"}},
+                selection_config={
+                    **V47_EFFECTIVE_CONFIG,
+                    "enabled": True,
+                    "mode": "v4_7_top10_score_tilt",
+                    "research_id": "v4_7_0001",
+                    "holdings": 10,
+                    "target_method": "v4_7_factor_selection_score_tilt",
+                    "allocation_method": "score_tilt",
+                    "execution_strategy": "factor-v4.7",
+                    "state_strategy": "v4_7_top10_score_tilt",
+                },
+                execution_config={
+                    "enabled": True,
+                    "target_path": str(target_path),
+                    "approved_target_sha256": approved_hash,
+                    "maximum_target_age_days": 40,
+                    "legacy_managed_symbols": [],
+                    "paper_only": True,
+                    "capital_allocation_usd": 100_000,
+                    "journal_path": str(root / "journal.json"),
+                    "state_key_path": str(root / "state.key"),
+                },
+                state_path=root / "state.json",
+            )
+        self.assertEqual(output["strategy"], "factor-v4.7")
+        self.assertAlmostEqual(sum(output["target_weights"].values()), 1.0)
+        self.assertTrue(
+            all(row["reason"] == "v4_7_top10_score_tilt_rebalance" for row in output["trade_plan"])
+        )
 
 
 if __name__ == "__main__":

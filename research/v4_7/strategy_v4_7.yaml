@@ -1,0 +1,128 @@
+version: 1
+research_id: v4_7_0001
+revision: r0
+contract_frozen_on: '2026-08-13'
+purpose: Test bounded score-proportional allocation inside the unchanged V4.6 Top 10.
+classification: exploratory_historical_validation_not_blind
+allocation_scope: fixed_v46_signal_weights_and_top10_score_tilt_only
+
+prior_access_disclosure:
+  validation_data_previously_accessed: true
+  confirmatory_claim_allowed: false
+
+baseline:
+  contract:
+    path: config/strategy_v4_6_r1.yaml
+    sha256: d4aaa32c419d2d37bde8ade763e0a3aee61e964209a8e7c4fac80d02f8c1cae2
+  result:
+    path: data/v46r1_builds/v46r1-validation-15d5825b0cd9ae78/v4_6_r1_result.json
+    sha256: 03333aa79426e298bdad6e90ff62155fee2693a67c9932de73a6d3d47f85040a
+
+factor_snapshot:
+  source_release: '202606'
+  manifest:
+    path: data/v46r1_sources/ff_202606/manifest.json
+    sha256: 4d2d79bb226871b90f7547128739775c6fcf40bf6edbce2d1009be0af6a6eeec
+
+periods:
+  training_start: '2021-01-01'
+  training_end: '2025-12-31'
+  expected_training_complete_periods: 58
+  validation_start: '2026-01-02'
+  maximum_permitted_observation_date: '2026-07-31'
+  latest_complete_exit: '2026-07-01'
+  expected_validation_complete_periods: 6
+  partial_periods: excluded
+
+inputs:
+  training_panel:
+    path: data/v42_builds/20260731T143508832626Z-1feee2382a34/eligible_signal_panel.parquet
+    sha256: 60c53b7064ec3e317d91f637f31871854f820d8f831b9850fd8d28a98f80fa08
+  training_prices:
+    path: data/v4_builds/20260731T133608560637Z-8961e5d13653/prices_by_security_training.parquet
+    sha256: b6dd6e9dc536fd44be6f0997e083ecd50bbb0af5cc608884fb0d07e0879125b0
+  training_factors:
+    path: data/v46r1_sources/ff_202606/ff_factors.parquet
+    sha256: 1d188c43480f005457b009594fac9ef41b59b344eedd55b488cc7ecedbdadbaf
+  validation_panel:
+    path: data/v42_builds/20260731T144049632501Z-bcb6b6b8f75a/validation_signal_panel.parquet
+    sha256: 28c37b8d3ec8a038d5505ef3237bccbcbdf7be9394ced30dd9dc112b5638a018
+  validation_prices:
+    path: data/v42_builds/20260731T144049632501Z-bcb6b6b8f75a/validation_prices_by_security.parquet
+    sha256: 73392195985524c064795ec6afc21aaafc262f0f4bbe493e9bde614d97c85384
+  validation_factors:
+    path: data/v46r1_sources/ff_202606/ff_factors.parquet
+    sha256: 1d188c43480f005457b009594fac9ef41b59b344eedd55b488cc7ecedbdadbaf
+  existing_frozen_artifacts_only: true
+  external_requests_allowed: false
+
+alpha_model:
+  signals: [size, value, profitability, investment, momentum]
+  percentile_columns:
+    size: size_percentile
+    value: value_percentile
+    profitability: profitability_percentile
+    investment: investment_percentile
+    momentum: momentum_percentile
+  signal_weights: {size: 0.10, value: 0.30, profitability: 0.10, investment: 0.30, momentum: 0.20}
+  missing_signal_policy: ineligible
+
+allocation_search:
+  baseline_method: equal_weight
+  dynamic_method: score_tilt
+  transform: normalized_composite_score_power_then_constrained_l2_projection
+  score_powers: [1, 2, 4, 6]
+  expected_candidates: 5
+
+risk_eligibility:
+  minimum_observations: 504
+  minimum_adv20_observations: 15
+  inherited_minimum_allocation_weight: 0.02
+
+risk_model:
+  factor_availability: conservative_t_minus_2_month_end
+  factor_lag_months: 2
+  historical_vintage_policy: official_202606_snapshot_with_disclosed_revision_risk
+  lookback_trading_days: 756
+
+portfolio:
+  universe: point_in_time_sp500
+  holdings: 10
+  long_only: true
+  fully_invested: true
+  minimum_weight: 0.05
+  maximum_weight: 0.20
+  maximum_industry_weight: 0.35
+  score_weight_monotonicity_required: true
+  selection_maximum_names_per_industry: 3
+  maximum_trade_pct_adv20: 0.02
+  portfolio_notional_usd: 1000000
+  full_transition_liquidity_screen_weight: 0.20
+  live_orders_allowed: false
+
+costs:
+  primary_one_way_bps: 10
+  sensitivity_one_way_bps: [5, 10, 20]
+
+training_selection:
+  require_complete_periods: 58
+  dynamic_tilt_must_exceed_equal_weight: true
+  ordering:
+    - cumulative_net_return_desc
+    - annualized_volatility_asc
+    - maximum_drawdown_desc
+    - average_turnover_asc
+    - candidate_id_asc
+  no_dynamic_improvement_policy: retain_equal_weight_and_fail_dynamic_hypothesis
+
+validation_evaluation:
+  require_complete_periods: 6
+  primary_comparator: equal_weight_same_top10
+  cumulative_net_return_must_exceed_equal_weight: true
+  benchmark: SPY
+
+publication:
+  maximum_validation_publications: 1
+  training_winner_must_be_frozen_before_validation: true
+  future_dates_forbidden: true
+

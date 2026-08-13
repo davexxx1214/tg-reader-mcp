@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "research_id": "v4_7_0001",
+  "certificate_type": "post_validation_integrity_audit_not_blindness_repair",
+  "source_scope": [
+    "src/**/*.py",
+    "v45/**/*.py",
+    "v46/**/*.py",
+    "v47/**/*.py",
+    "requirements-v41.txt",
+    "requirements-v42.txt"
+  ],
+  "source_file_count": 87,
+  "source_tree_sha256": "f5f741f4cd44c6fc80c66e89bde86dce3c4ba1c3da76095c72fc3a9ffb61a614",
+  "runtime": {
+    "python": "3.13.12 | packaged by Anaconda, Inc. | (main, Feb 24 2026, 16:05:56) [MSC v.1942 64 bit (AMD64)]",
+    "packages": {
+      "numpy": "2.4.4",
+      "pandas": "3.0.2",
+      "scipy": "1.17.1",
+      "cvxpy": "1.9.2",
+      "clarabel": "0.11.1",
+      "pyarrow": "25.0.0",
+      "PyYAML": "6.0.3"
+    }
+  },
+  "frozen_candidate_crosscheck": {
+    "candidate_id_matches": true,
+    "allocation_method_matches": true,
+    "power_matches": true,
+    "signal_weights_match": true
+  },
+  "validation_artifacts": {
+    "corrected_validation_eligibility.parquet": {
+      "path": "data/v47_builds/v47-validation-bd3583529dc86d62/corrected_validation_eligibility.parquet",
+      "sha256": "46b9a3680ee71d184a17e309db1fdf038e5796fc47d29fb4b2fa9bc1b05bc201"
+    },
+    "equal_weight_validation_holdings.csv": {
+      "path": "data/v47_builds/v47-validation-bd3583529dc86d62/equal_weight_validation_holdings.csv",
+      "sha256": "af0ee294553a040abae35ae5db45324ab4cbec131fb33b66fe5817041fded7b6"
+    },
+    "equal_weight_validation_monthly_returns.csv": {
+      "path": "data/v47_builds/v47-validation-bd3583529dc86d62/equal_weight_validation_monthly_returns.csv",
+      "sha256": "39011e4ea861278f75c714a297f8c79e82577ffa2406075a3d1da00c24331a29"
+    },
+    "selected_validation_holdings.csv": {
+      "path": "data/v47_builds/v47-validation-bd3583529dc86d62/selected_validation_holdings.csv",
+      "sha256": "1e5b77ecf6b80c0a7704a64be37319566fe716cd11b38655fb567e8e0b6d3210"
+    },
+    "selected_validation_monthly_returns.csv": {
+      "path": "data/v47_builds/v47-validation-bd3583529dc86d62/selected_validation_monthly_returns.csv",
+      "sha256": "4f04ce1b8e1365539875f47e833373638c6cda6ae3f7c64c5080f74f35ad28d3"
+    },
+    "v4_7_report.md": {
+      "path": "data/v47_builds/v47-validation-bd3583529dc86d62/v4_7_report.md",
+      "sha256": "353e9717d7783afc9c22acee711f723c2ef5761f0be47f1b4b8ec576e748ac8b"
+    },
+    "v4_7_result.json": {
+      "path": "data/v47_builds/v47-validation-bd3583529dc86d62/v4_7_result.json",
+      "sha256": "aa0051840d928f302638d52acd4e90222b8f357361873812b0c06690df708fa4"
+    },
+    "validation_factor_availability_audit.csv": {
+      "path": "data/v47_builds/v47-validation-bd3583529dc86d62/validation_factor_availability_audit.csv",
+      "sha256": "ea8b5bf5243aa981adf901bffeb67db702a5d15111a5e8a4b48bf958daa19250"
+    }
+  }
+}

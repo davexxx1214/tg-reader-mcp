@@ -1,9 +1,9 @@
 ---
 name: tg-reader-mcp
-description: Operate this repository's Telegram reader, standalone V4.6-R1 S&P 500 ten-stock factor portfolio, and legacy TACO tools. Use for point-in-time factor scoring, Fama-French data acquisition, monthly basket generation, parameter research, audit, Alpaca Paper dry-runs, and approved rebalances. Never combine TACO/nTACO with V4.6-R1 unless the user explicitly creates a new research version.
+description: Operate this repository's Telegram reader, standalone V4.7 S&P 500 ten-stock score-tilted factor portfolio, its V4.6-R1 predecessor, and legacy TACO tools. Use for point-in-time factor scoring, Fama-French data acquisition, monthly basket generation, V4.6-to-V4.7 target upgrades, parameter research, audit, Alpaca Paper dry-runs, and approved rebalances. Never combine TACO/nTACO with V4.7 unless the user explicitly creates a new research version.
 ---
 
-# TG Reader MCP and V4.6-R1
+# TG Reader MCP and V4.7
 
 Run commands from the repository root. On Windows PowerShell:
 
@@ -15,22 +15,23 @@ $PYTHON = ".\.venv\Scripts\python.exe"
 
 Treat these as independent systems:
 
-- `V4.6-R1`: select 10 S&P 500 stocks monthly and hold each at 10% of the strategy sleeve.
+- `V4.7`: use the frozen V4.6-R1 signals and Top 10, then allocate 5%–20% per name with the frozen score-power-6 tilt.
+- `V4.6-R1`: retained as the immutable equal-weight predecessor and rollback target.
 - `nTACO/QQQ`: legacy, separate research and backtest code in `taco_strategy.py` and `backtest_ntaco_qqq.py`.
-- Telegram MCP: message ingestion and querying; it does not determine V4.6-R1 positions.
+- Telegram MCP: message ingestion and querying; it does not determine V4.7 positions.
 
-For V4.6-R1, never download or read TACO data, never calculate nTACO, never scale the ten-stock basket to 80% or 0%, and never use QQQ as the execution target. Do not import `sync_taco_data.py` or `calculate_ntaco_signal` in the V4.6-R1 execution path.
+For V4.7, never download or read TACO data, never calculate nTACO, never scale the ten-stock basket to 80% or 0%, and never use QQQ as the execution target. Do not import `sync_taco_data.py` or `calculate_ntaco_signal` in the V4.7 execution path.
 
-## Frozen V4.6-R1 contract
+## Frozen V4.7 contract
 
 Use these production parameters:
 
 ```yaml
 factor_portfolio:
   enabled: true
-  mode: v4_6_r1_top10
+  mode: v4_7_top10_score_tilt
   parameter_mode: frozen
-  research_id: v4_6_r1_0001
+  research_id: v4_7_0001
   holdings: 10
   max_names_per_industry: 3
   minimum_industry_count: 10
@@ -38,7 +39,11 @@ factor_portfolio:
   winsor_lower: 0.01
   winsor_upper: 0.99
   factor_lag_months: 2
-  allocation_method: equal_weight
+  allocation_method: score_tilt
+  score_power: 6
+  minimum_weight: 0.05
+  maximum_weight: 0.20
+  maximum_industry_weight: 0.35
   rebalance_frequency: monthly
   weights:
     size: 0.10
@@ -48,11 +53,13 @@ factor_portfolio:
     momentum: 0.20
 ```
 
-The target always contains exactly 10 unique securities with `target_weight: 0.1`; total target weight is 1.0.
+The target always contains exactly 10 unique securities. Transform each composite score with `score^6`, normalize, then project to total weight 1.0, 5%–20% per name, at most 35% per FF12 industry, and global score-weight monotonicity. Higher-score names must never receive less weight than lower-score names.
+
+Use `research/v4_7/` as the local frozen evidence bundle. It contains the contract, winner manifest, status, integrity certificate, and published report copied from the research repository. Do not edit these files to change runtime behavior.
 
 ## Why five stock scores appear in a six-factor model
 
-The Fama-French five factors plus Momentum contain six return factors: market, size, value, profitability, investment, and momentum. V4.6-R1 uses five cross-sectional stock-selection signals because the market factor is common market exposure rather than a stock-ranking characteristic. Store and audit FF6 data for risk attribution; do not add the market factor to an individual stock's composite score.
+The Fama-French five factors plus Momentum contain six return factors: market, size, value, profitability, investment, and momentum. V4.7 inherits V4.6-R1's five cross-sectional stock-selection signals because the market factor is common market exposure rather than a stock-ranking characteristic. Store and audit FF6 data for risk attribution; do not add the market factor to an individual stock's composite score.
 
 ## Point-in-time input contract
 
@@ -103,9 +110,9 @@ score = 0.10 × Size_pct
 6. Require all five percentiles, `risk_eligible=true`, and ADV20 of at least $10 million.
 7. Sort by score descending, breaking ties with `security_id`.
 8. Select 10 names with at most 3 from one FF12 industry.
-9. Assign every selected name 10%.
+9. Keep the same Top 10 as V4.6-R1 and apply the frozen score-power-6 projection.
 
-Do not optimize execution weights. The score chooses stocks; equal weights build the portfolio.
+Do not estimate weights from returns at execution time. The frozen deterministic projection maps current composite scores to target weights.
 
 ## Data acquisition
 
@@ -142,20 +149,38 @@ Generate the frozen target:
 & $PYTHON scripts\factor_portfolio.py
 ```
 
+For frozen V4.7, this command atomically writes both the equal-weight
+`factor_portfolio_v4_6_r1_YYYYMMDD.json` membership anchor and the configured
+V4.7 target. The V4.7 artifact binds that anchor by filename and SHA-256; do
+not delete or rename the anchor while the target can still be executed or
+reconciled.
+
 Validate the output before approval:
 
-- `method == v4_6_r1_factor_selection`;
-- `research_id == v4_6_r1_0001` and `parameter_mode == frozen`;
+- `method == v4_7_factor_selection_score_tilt`;
+- `research_id == v4_7_0001` and `parameter_mode == frozen`;
 - exactly 10 unique tickers and security IDs;
 - consecutive selection ranks 1–10;
-- every target weight equals 0.1;
+- weights sum to 1.0, stay within 5%–20%, respect the 35% industry cap, and are monotone with score;
 - manifest hashes and FF6 risk audit pass;
 - no input availability date exceeds the decision date.
+
+When only an already approved V4.6-R1 monthly target is available, preserve it and generate V4.7 without changing the Top 10:
+
+```powershell
+$HASH = (Get-FileHash data\factor_portfolio_v4_6_r1_20260812.json -Algorithm SHA256).Hash.ToLower()
+& $PYTHON scripts\upgrade_v47_target.py `
+  --input data\factor_portfolio_v4_6_r1_20260812.json `
+  --approved-sha256 $HASH `
+  --output data\factor_portfolio_v4_7_latest.json
+```
+
+The V4.7 artifact must carry the predecessor filename and SHA-256. A same-decision-date upgrade is allowed only when the predecessor file reproduces the same rank/security ID/ticker list and its hash exactly matches the signed V4.6-R1 execution state.
 
 After human review, calculate the exact artifact hash and place it in `factor_execution.approved_target_sha256`:
 
 ```powershell
-(Get-FileHash data\factor_portfolio_latest.json -Algorithm SHA256).Hash.ToLower()
+(Get-FileHash data\factor_portfolio_v4_7_latest.json -Algorithm SHA256).Hash.ToLower()
 ```
 
 Any change to the JSON invalidates approval. Never fill the hash automatically and immediately trade; approval is an independent gate.
@@ -167,7 +192,7 @@ Keep research selection and broker execution separate:
 ```yaml
 factor_execution:
   enabled: true
-  target_path: data/factor_portfolio_latest.json
+  target_path: data/factor_portfolio_v4_7_latest.json
   approved_target_sha256: ""
   state_path: data/factor_execution_state.json
   state_key_path: data/factor_execution_state.key
@@ -189,7 +214,7 @@ Run a deterministic dry-run:
 
 ```powershell
 & $PYTHON scripts\run_analysis_trade_pipeline.py `
-  --strategy factor-v4.6-r1 `
+  --strategy factor-v4.7 `
   --execution-date 2026-08-12 `
   --skip-account-refresh `
   --skip-data-sync
@@ -198,25 +223,25 @@ Run a deterministic dry-run:
 For a current-date dry-run with fresh account and prices:
 
 ```powershell
-& $PYTHON scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1
+& $PYTHON scripts\run_analysis_trade_pipeline.py --strategy factor-v4.7
 ```
 
 Only after reviewing the dry-run, execute on Alpaca Paper:
 
 ```powershell
 & $PYTHON scripts\run_analysis_trade_pipeline.py `
-  --strategy factor-v4.6-r1 `
+  --strategy factor-v4.7 `
   --execute-trades
 ```
 
-Never pass a manual execution date to execution. V4.6-R1 is unconditionally Paper-only: `paper_only: false` is rejected, even if the user changes the YAML. Any future live version requires a different strategy identifier and separately reviewed entry point.
+Never pass a manual execution date to execution. V4.7 is unconditionally Paper-only: `paper_only: false` is rejected, even if the user changes the YAML. Any future live version requires a different strategy identifier and separately reviewed entry point.
 
 ## Execution safety contract
 
 The executor must:
 
 - load only the approved, non-stale frozen artifact;
-- produce exactly ten target weights of 10%;
+- produce exactly ten positive target weights that sum to 100% and satisfy the frozen V4.7 bounds;
 - keep gross and net target exposure at or below 100%, with no short positions;
 - submit factor buys as cash-checked limit orders, never market buys; reject a buy when `qty × limit_price` exceeds current broker cash;
 - recheck the current long quantity immediately before each sell and reject any oversell;
@@ -224,7 +249,7 @@ The executor must:
 - reject an existing manual position that collides with a new target;
 - use the authenticated ownership ledger, not ticker membership, to determine sell authority;
 - protect the ledger signing key with current-user Windows DPAPI (or POSIX `0600` outside Windows);
-- use fractional shares to approach equal weights;
+- use fractional shares to approach the score-tilted target weights;
 - persist an order-intent journal before submission;
 - query every open Alpaca order before journaling, and reject conflicts on target or strategy-owned tickers;
 - attach deterministic Alpaca `client_order_id` values;
@@ -240,18 +265,18 @@ The output `data/factor_alpaca_pipeline_latest.json` must not contain `signal`, 
 Do not silently tune the frozen production contract. To test weights or constraints:
 
 1. set `parameter_mode: research`;
-2. use a new `research_id`, never `v4_6_r1_0001`;
+2. use a new `research_id`, never `v4_7_0001`;
 3. preregister the candidate grid and cost assumptions;
 4. use 2021–2025 only for training/research;
 5. use 2026 YTD only as a validation set, never feed it back into tuning;
 6. report return, volatility, Sharpe, drawdown, turnover, cost sensitivity, and comparison with SPY;
 7. promote only through a new named version and a new frozen contract.
 
-Do not add TACO as a score, exposure overlay, or tuning variable under the V4.6-R1 name.
+Do not add TACO as a score, exposure overlay, or tuning variable under the V4.7 name.
 
 ## Independent legacy TACO tools
 
-Use `scripts/sync_taco_data.py`, `scripts/taco_strategy.py`, and `scripts/backtest_ntaco_qqq.py` only when the user explicitly asks about the separate TACO/QQQ strategy. Their configuration may remain in `config.yaml`, but V4.6-R1 code must not read it.
+Use `scripts/sync_taco_data.py`, `scripts/taco_strategy.py`, and `scripts/backtest_ntaco_qqq.py` only when the user explicitly asks about the separate TACO/QQQ strategy. Their configuration may remain in `config.yaml`, but V4.7 code must not read it.
 
 ## Validation
 

@@ -46,6 +46,12 @@ from query_alpaca_account import (
 from query_stock_prices import _fetch_alpaca_snapshots
 from sync_alpha_daily_to_sqlite import DEFAULT_DB_PATH as DEFAULT_PRICE_DB
 from sync_alpha_daily_to_sqlite import sync_symbols
+from factor_portfolio import (
+    FactorPortfolioError,
+    allocate_score_tilt,
+    effective_config_sha256,
+    effective_factor_config,
+)
 
 
 def _load_factor_basket(
@@ -56,6 +62,9 @@ def _load_factor_basket(
     expected_holdings: int,
     maximum_age_days: int,
     approved_sha256: str = "",
+    expected_method: str = "v4_6_r1_factor_selection",
+    expected_allocation_method: str = "equal_weight",
+    expected_effective_config: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Load one immutable frozen monthly ten-stock basket, failing closed."""
     if not path.is_file():
@@ -70,14 +79,26 @@ def _load_factor_basket(
     artifact_hash = hashlib.sha256(raw_payload).hexdigest()
     if not approved_sha256 or artifact_hash != approved_sha256:
         raise RuntimeError("Factor target SHA-256 is not independently approved")
-    if payload.get("method") != "v4_6_r1_factor_selection":
-        raise RuntimeError("Factor target method is not the frozen V4.6-R1 selector")
+    if payload.get("method") != expected_method:
+        raise RuntimeError("Factor target method is not the configured frozen selector")
     if payload.get("parameter_mode") != "frozen":
         raise RuntimeError("Factor execution requires a frozen target")
     if payload.get("research_id") != expected_research_id:
         raise RuntimeError("Factor target research_id does not match config")
-    if payload.get("allocation_method") != "equal_weight":
-        raise RuntimeError("Factor execution requires equal_weight allocation")
+    if payload.get("allocation_method") != expected_allocation_method:
+        raise RuntimeError("Factor target allocation method does not match config")
+    if expected_allocation_method == "score_tilt":
+        if expected_effective_config is None:
+            raise RuntimeError("Factor target expected effective config is missing")
+        expected_config = dict(expected_effective_config)
+        actual_config = payload.get("effective_config")
+        expected_config_hash = effective_config_sha256(expected_config)
+        if (
+            payload.get("score_power") != 6.0
+            or actual_config != expected_config
+            or payload.get("effective_config_sha256") != expected_config_hash
+        ):
+            raise RuntimeError("Factor target effective config does not match frozen V4.7")
     try:
         target_day = date.fromisoformat(str(payload["decision_date"]))
         execution_day = date.fromisoformat(str(execution_date))
@@ -112,14 +133,110 @@ def _load_factor_basket(
         security_ids.append(security_id)
     if len(set(tickers)) != expected_holdings or len(set(security_ids)) != expected_holdings:
         raise RuntimeError("Factor target contains duplicate tickers or security_ids")
-    base_weight = 1.0 / expected_holdings
+    if expected_allocation_method == "equal_weight":
+        target_weights = {ticker: 1.0 / expected_holdings for ticker in tickers}
+        members_match_predecessor = False
+    else:
+        try:
+            target_weights = {
+                ticker: float(row["target_weight"])
+                for ticker, row in zip(tickers, ordered)
+            }
+            scores = [float(row["score"]) for row in ordered]
+            industries = [str(row["ff_industry_12"]).strip() for row in ordered]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("Factor target score-tilt weights are invalid") from exc
+        if any(not math.isfinite(score) for score in scores) or any(
+            not industry for industry in industries
+        ):
+            raise RuntimeError("Factor target score or industry is invalid")
+        if (
+            abs(sum(target_weights.values()) - 1.0) > 1e-7
+            or min(target_weights.values()) < 0.05 - 1e-7
+            or max(target_weights.values()) > 0.20 + 1e-7
+            or any(not math.isfinite(value) for value in target_weights.values())
+        ):
+            raise RuntimeError("Factor target score-tilt weights violate frozen bounds")
+        score_order = sorted(range(expected_holdings), key=lambda index: (-scores[index], index))
+        ordered_weights = [target_weights[tickers[index]] for index in score_order]
+        if any(left < right - 1e-7 for left, right in zip(ordered_weights, ordered_weights[1:])):
+            raise RuntimeError("Factor target score-weight monotonicity is violated")
+        for industry in set(industries):
+            industry_weight = sum(
+                target_weights[ticker]
+                for ticker, row_industry in zip(tickers, industries)
+                if row_industry == industry
+            )
+            if industry_weight > 0.35 + 1e-7:
+                raise RuntimeError("Factor target industry weight exceeds 35%")
+        try:
+            recomputed = allocate_score_tilt(
+                ordered,
+                power=float(expected_effective_config["score_power"]),
+                minimum_weight=float(expected_effective_config["minimum_weight"]),
+                maximum_weight=float(expected_effective_config["maximum_weight"]),
+                maximum_industry_weight=float(expected_effective_config["maximum_industry_weight"]),
+            )
+        except (FactorPortfolioError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("Factor target frozen score projection cannot be reproduced") from exc
+        if any(
+            abs(float(row["target_weight"]) - float(expected_row["target_weight"])) > 1e-9
+            for row, expected_row in zip(ordered, recomputed)
+        ):
+            raise RuntimeError("Factor target weights do not match the frozen score projection")
+        members_match_predecessor = False
+    predecessor = payload.get("predecessor_target")
+    if predecessor is not None and (
+        not isinstance(predecessor, dict)
+        or predecessor.get("research_id") != "v4_6_r1_0001"
+        or len(str(predecessor.get("sha256", ""))) != 64
+        or Path(str(predecessor.get("artifact_filename", ""))).name
+        != str(predecessor.get("artifact_filename", ""))
+    ):
+        raise RuntimeError("Factor target predecessor link is invalid")
+    if expected_allocation_method == "score_tilt":
+        if not isinstance(predecessor, dict) or not predecessor.get("artifact_filename"):
+            raise RuntimeError("Factor target predecessor artifact is missing")
+        predecessor_path = path.parent / str(predecessor["artifact_filename"])
+        try:
+            predecessor_bytes = predecessor_path.read_bytes()
+            predecessor_payload = json.loads(predecessor_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Factor target predecessor artifact cannot be loaded") from exc
+        if (
+            hashlib.sha256(predecessor_bytes).hexdigest() != predecessor.get("sha256")
+            or not isinstance(predecessor_payload, dict)
+            or predecessor_payload.get("method") != "v4_6_r1_factor_selection"
+            or predecessor_payload.get("research_id") != "v4_6_r1_0001"
+        ):
+            raise RuntimeError("Factor target predecessor artifact is not authentic")
+        predecessor_selected = predecessor_payload.get("selected")
+        if not isinstance(predecessor_selected, list) or len(predecessor_selected) != expected_holdings:
+            raise RuntimeError("Factor target predecessor membership is invalid")
+        predecessor_ordered = sorted(
+            predecessor_selected, key=lambda row: int(row.get("selection_rank", 0))
+        )
+        identity = lambda row: (
+            int(row.get("selection_rank", 0)),
+            str(row.get("security_id", "")).strip(),
+            str(row.get("ticker", "")).upper().strip(),
+        )
+        members_match_predecessor = [identity(row) for row in ordered] == [
+            identity(row) for row in predecessor_ordered
+        ]
+        if not members_match_predecessor:
+            raise RuntimeError("Factor target members or ranks differ from the V4.6 predecessor")
     return {
         "path": str(path),
         "artifact_sha256": artifact_hash,
         "decision_date": target_day.isoformat(),
         "age_days": age_days,
         "research_id": expected_research_id,
-        "base_weights": {ticker: base_weight for ticker in tickers},
+        "target_weights": target_weights,
+        "base_weights": target_weights,
+        "allocation_method": expected_allocation_method,
+        "predecessor_target": predecessor,
+        "members_match_predecessor": members_match_predecessor,
     }
 
 
@@ -129,6 +246,7 @@ def _build_factor_rebalance_plan(
     positions: Iterable[Mapping[str, Any]],
     prices: Mapping[str, Any],
     target_weights: Mapping[str, Any],
+    reason: str = "v4_6_r1_top10_rebalance",
 ) -> List[Dict[str, Any]]:
     """Create fractional-share orders for the isolated factor sleeve."""
     equity = float(account.get("equity") or account.get("portfolio_value") or 0.0)
@@ -155,10 +273,13 @@ def _build_factor_rebalance_plan(
     }
     if (
         len(normalized_targets) != 10
-        or any(not symbol or abs(weight - 0.1) > 1e-9 for symbol, weight in normalized_targets.items())
+        or any(
+            not symbol or not math.isfinite(weight) or weight <= 0.0 or weight > 1.0
+            for symbol, weight in normalized_targets.items()
+        )
         or abs(sum(normalized_targets.values()) - 1.0) > 1e-9
     ):
-        raise ValueError("V4.6-R1 requires exactly ten 10% target weights")
+        raise ValueError("Factor portfolio requires ten positive target weights summing to 100%")
     plan: List[Dict[str, Any]] = []
     for symbol in sorted(set(position_map) | set(normalized_targets)):
         current_qty = position_map.get(symbol, {}).get("qty", 0.0)
@@ -181,7 +302,7 @@ def _build_factor_rebalance_plan(
                 "current_qty": current_qty,
                 "target_qty": target_qty,
                 "target_weight": target_weight,
-                "reason": "v4_6_r1_top10_rebalance",
+                "reason": reason,
             }
         )
     return sorted(plan, key=lambda item: (item["action"] != "sell", item["symbol"]))
@@ -453,7 +574,7 @@ def _load_factor_execution_state(path: Path, *, secret: str = "") -> Dict[str, A
     if (
         not isinstance(payload, dict)
         or payload.get("schema_version") != 1
-        or payload.get("strategy") != "v4_6_r1_top10"
+        or payload.get("strategy") not in {"v4_6_r1_top10", "v4_7_top10_score_tilt"}
         or not isinstance(payload.get("owned_quantities"), dict)
     ):
         raise RuntimeError("Factor execution state contract is invalid")
@@ -499,7 +620,17 @@ def _validate_factor_target_transition(
         basket_date == prior_date
         and str(basket.get("artifact_sha256")) != str(state.get("target_artifact_sha256"))
     ):
-        raise RuntimeError("Factor target changed after this monthly basket was executed")
+        predecessor = basket.get("predecessor_target")
+        valid_upgrade = (
+            state.get("strategy") == "v4_6_r1_top10"
+            and basket.get("research_id") == "v4_7_0001"
+            and isinstance(predecessor, Mapping)
+            and predecessor.get("research_id") == "v4_6_r1_0001"
+            and predecessor.get("sha256") == state.get("target_artifact_sha256")
+            and basket.get("members_match_predecessor") is True
+        )
+        if not valid_upgrade:
+            raise RuntimeError("Factor target changed after this monthly basket was executed")
 
 
 def _resolve_root_path(value: str) -> Path:
@@ -625,6 +756,9 @@ def _prepare_execution_journal(
     *,
     target_sha256: str,
     execution_date: str,
+    strategy: str = "v4_6_r1_top10",
+    target_artifact_path: Optional[Path] = None,
+    target_method: str = "v4_6_r1_factor_selection",
 ) -> List[Dict[str, Any]]:
     """Persist deterministic order intents before any broker-side mutation."""
     if path.exists():
@@ -648,7 +782,8 @@ def _prepare_execution_journal(
             separators=(",", ":"),
         )
         intent_key = hashlib.sha256(intent.encode("utf-8")).hexdigest()[:16]
-        order_id = f"fv46-{intent_key}-{index:02d}-{item['action'][0]}-{item['symbol']}"
+        prefix = "fv47" if strategy == "v4_7_top10_score_tilt" else "fv46"
+        order_id = f"{prefix}-{intent_key}-{index:02d}-{item['action'][0]}-{item['symbol']}"
         if len(order_id) > 48:
             order_id = order_id[:48]
         item["client_order_id"] = order_id
@@ -657,9 +792,11 @@ def _prepare_execution_journal(
         path,
         {
             "schema_version": 1,
-            "strategy": "v4_6_r1_top10",
+            "strategy": strategy,
             "status": "prepared",
             "target_sha256": target_sha256,
+            "target_artifact_filename": Path(target_artifact_path).name if target_artifact_path else "",
+            "target_method": target_method,
             "execution_date": execution_date,
             "orders": journaled,
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -846,10 +983,11 @@ def _write_factor_execution_state(
     target_artifact_sha256: str,
     target_decision_date: str,
     secret: str,
+    strategy: str = "v4_6_r1_top10",
 ) -> None:
     payload = {
             "schema_version": 1,
-            "strategy": "v4_6_r1_top10",
+            "strategy": strategy,
             "owned_quantities": {
                 str(symbol).upper(): float(quantity)
                 for symbol, quantity in sorted(owned_quantities.items())
@@ -871,7 +1009,7 @@ def _exclusive_run_lock(state_path: Path):
     try:
         descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError as exc:
-        raise RuntimeError(f"V4.6-R1 pipeline is already running; lock exists: {lock_path}") from exc
+        raise RuntimeError(f"Factor pipeline is already running; lock exists: {lock_path}") from exc
     try:
         os.write(descriptor, str(os.getpid()).encode("ascii"))
         yield
@@ -881,14 +1019,14 @@ def _exclusive_run_lock(state_path: Path):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the fully invested V4.6-R1 top-10 stocks")
+    parser = argparse.ArgumentParser(description="Run a frozen fully invested top-10 factor portfolio")
     parser.add_argument(
         "--strategy",
         required=True,
-        choices=["factor-v4.6-r1"],
+        choices=["factor-v4.6-r1", "factor-v4.7"],
         help="Explicitly select the ten-stock execution contract",
     )
-    parser.add_argument("--execute-trades", action="store_true", help="Submit live Alpaca orders; default is dry-run")
+    parser.add_argument("--execute-trades", action="store_true", help="Submit Alpaca Paper orders; default is dry-run")
     parser.add_argument("--skip-account-refresh", action="store_true")
     parser.add_argument("--skip-data-sync", action="store_true", help="Use existing stock-price data")
     parser.add_argument("--skip-price-sync", action="store_true")
@@ -917,6 +1055,12 @@ def _run_pipeline(
     )
     if not selection_config["enabled"] or not execution_config["enabled"]:
         raise RuntimeError("factor selection and execution must be enabled")
+    configured_strategy = str(
+        selection_config.get("execution_strategy", "factor-v4.6-r1")
+    )
+    requested_strategy = str(getattr(args, "strategy", configured_strategy))
+    if requested_strategy != configured_strategy:
+        raise RuntimeError("Requested strategy does not match the frozen factor config")
     alpaca_paper_value = config.get("alpaca", {}).get("paper", True)
     alpaca_paper = (
         alpaca_paper_value
@@ -938,6 +1082,17 @@ def _run_pipeline(
         expected_holdings=int(selection_config["holdings"]),
         maximum_age_days=int(execution_config["maximum_target_age_days"]),
         approved_sha256=str(execution_config["approved_target_sha256"]),
+        expected_method=str(
+            selection_config.get("target_method", "v4_6_r1_factor_selection")
+        ),
+        expected_allocation_method=str(
+            selection_config.get("allocation_method", "equal_weight")
+        ),
+        expected_effective_config=(
+            effective_factor_config(selection_config)
+            if selection_config.get("allocation_method") == "score_tilt"
+            else None
+        ),
     )
     state_key_path = _resolve_root_path(execution_config["state_key_path"])
     state_secret = (
@@ -947,7 +1102,7 @@ def _run_pipeline(
     )
     execution_state = _load_factor_execution_state(state_path, secret=state_secret)
     _validate_factor_target_transition(basket, execution_state)
-    basket_symbols = set(basket["base_weights"])
+    basket_symbols = set(basket["target_weights"])
     managed_symbols = (
         basket_symbols
         | set(execution_state["owned_quantities"])
@@ -983,7 +1138,7 @@ def _run_pipeline(
         capital_allocation_usd=float(execution_config["capital_allocation_usd"]),
     )
     managed_symbols = set(sleeve["managed_symbols"])
-    target_weights = dict(basket["base_weights"])
+    target_weights = dict(basket["target_weights"])
     price_symbols = basket_symbols | {
         str(position.get("symbol", "")).upper().strip()
         for position in sleeve["positions"]
@@ -1002,6 +1157,7 @@ def _run_pipeline(
         positions=sleeve["positions"],
         prices=prices,
         target_weights=target_weights,
+        reason=f"{selection_config.get('mode', 'v4_6_r1_top10')}_rebalance",
     )
     journal_path = _resolve_root_path(execution_config["journal_path"])
     if journal_path.exists():
@@ -1022,6 +1178,9 @@ def _run_pipeline(
             trade_plan,
             target_sha256=str(basket["artifact_sha256"]),
             execution_date=execution_date,
+            strategy=str(selection_config.get("state_strategy", "v4_6_r1_top10")),
+            target_artifact_path=_resolve_root_path(execution_config["target_path"]),
+            target_method=str(selection_config.get("target_method", "v4_6_r1_factor_selection")),
         )
     trade_results = (
         _execute_trade_plan(
@@ -1045,11 +1204,13 @@ def _run_pipeline(
             target_artifact_sha256=str(basket["artifact_sha256"]),
             target_decision_date=str(basket["decision_date"]),
             secret=state_secret,
+            strategy=str(selection_config.get("state_strategy", "v4_6_r1_top10")),
         )
         journal_path.unlink(missing_ok=True)
 
     output = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "strategy": configured_strategy,
         "mode": "live" if args.execute_trades else "dry_run",
         "data_sync": sync_results,
         "account_refresh": account_refresh,

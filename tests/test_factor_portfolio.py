@@ -15,6 +15,8 @@ from _config import get_factor_execution_config, get_factor_portfolio_config  # 
 from factor_portfolio import (  # noqa: E402
     DEFAULT_WEIGHTS,
     FactorPortfolioError,
+    allocate_score_tilt,
+    build_v46_predecessor_payload,
     candidate_weight_grid,
     conservative_factor_cutoff,
     derive_raw_factors,
@@ -23,18 +25,21 @@ from factor_portfolio import (  # noqa: E402
     validate_signal_manifest,
 )
 from sync_fama_french_factors import _write_sqlite, merge_factor_rows, parse_factor_csv  # noqa: E402
+from upgrade_v47_target import build_v47_target_from_v46  # noqa: E402
 
 
 class FactorPortfolioConfigTests(unittest.TestCase):
-    def test_default_v46r1_contract_is_frozen(self):
+    def test_default_v47_contract_is_frozen(self):
         parsed = get_factor_portfolio_config({})
         self.assertTrue(parsed["enabled"])
         self.assertEqual(parsed["weights"], DEFAULT_WEIGHTS)
         self.assertEqual(parsed["holdings"], 10)
         self.assertEqual(parsed["max_names_per_industry"], 3)
         self.assertEqual(parsed["factor_lag_months"], 2)
-        self.assertEqual(parsed["allocation_method"], "equal_weight")
-        self.assertEqual(parsed["mode"], "v4_6_r1_top10")
+        self.assertEqual(parsed["allocation_method"], "score_tilt")
+        self.assertEqual(parsed["mode"], "v4_7_top10_score_tilt")
+        self.assertEqual(parsed["research_id"], "v4_7_0001")
+        self.assertEqual(parsed["score_power"], 6.0)
 
     def test_execution_contract_is_separate_and_paper_only(self):
         parsed = get_factor_execution_config({})
@@ -73,8 +78,28 @@ class FactorPortfolioConfigTests(unittest.TestCase):
     def test_research_mode_requires_a_new_research_id(self):
         with self.assertRaises(ValueError):
             get_factor_portfolio_config(
-                {"factor_portfolio": {"parameter_mode": "research", "research_id": "v4_6_r1_0001"}}
+                {"factor_portfolio": {"parameter_mode": "research", "research_id": "v4_7_0001"}}
             )
+
+    def test_frozen_v47_contract_uses_score_power_six(self):
+        parsed = get_factor_portfolio_config(
+            {
+                "factor_portfolio": {
+                    "mode": "v4_7_top10_score_tilt",
+                    "parameter_mode": "frozen",
+                    "research_id": "v4_7_0001",
+                    "allocation_method": "score_tilt",
+                    "score_power": 6,
+                    "minimum_weight": 0.05,
+                    "maximum_weight": 0.20,
+                    "maximum_industry_weight": 0.35,
+                }
+            }
+        )
+        self.assertEqual(parsed["mode"], "v4_7_top10_score_tilt")
+        self.assertEqual(parsed["research_id"], "v4_7_0001")
+        self.assertEqual(parsed["allocation_method"], "score_tilt")
+        self.assertEqual(parsed["score_power"], 6.0)
 
 
 class FactorPortfolioScoringTests(unittest.TestCase):
@@ -130,6 +155,109 @@ class FactorPortfolioScoringTests(unittest.TestCase):
         for row in selected:
             industry_counts[row["ff_industry_12"]] = industry_counts.get(row["ff_industry_12"], 0) + 1
         self.assertLessEqual(max(industry_counts.values()), 3)
+
+    def test_v47_score_tilt_is_fully_invested_bounded_and_monotone(self):
+        selected = [
+            {
+                "security_id": f"S{index}",
+                "ticker": f"T{index}",
+                "ff_industry_12": "A" if index < 3 else f"I{index}",
+                "score": 1.0 - index * 0.05,
+            }
+            for index in range(10)
+        ]
+        tilted = allocate_score_tilt(
+            selected,
+            power=6,
+            minimum_weight=0.05,
+            maximum_weight=0.20,
+            maximum_industry_weight=0.35,
+        )
+        weights = [row["target_weight"] for row in tilted]
+        self.assertAlmostEqual(sum(weights), 1.0, places=8)
+        self.assertGreaterEqual(min(weights), 0.05 - 1e-8)
+        self.assertLessEqual(max(weights), 0.20 + 1e-8)
+        self.assertLessEqual(sum(weights[:3]), 0.35 + 1e-8)
+        self.assertTrue(all(left >= right - 1e-8 for left, right in zip(weights, weights[1:])))
+
+    def test_v47_allocator_conforms_to_frozen_research_golden_vector(self):
+        industries = ["A", "A", "A", "I3", "I4", "I5", "I6", "I7", "I8", "I9"]
+        selected = [
+            {"score": 1.0 - index * 0.05, "ff_industry_12": industries[index]}
+            for index in range(10)
+        ]
+        actual = [
+            row["target_weight"]
+            for row in allocate_score_tilt(
+                selected, power=6, minimum_weight=0.05, maximum_weight=0.20,
+                maximum_industry_weight=0.35,
+            )
+        ]
+        # Frozen from factor-model v47.research.score_tilt_weights with
+        # cvxpy 1.9.2 + CLARABEL before the production migration.
+        research_golden = [
+            0.14508208261909947, 0.10245895907395129, 0.10245895819243098,
+            0.10245895760672569, 0.10245895679001055, 0.10245894524965128,
+            0.10081343937089235, 0.08821255001256922, 0.07962973506437031,
+            0.07396741602029894,
+        ]
+        self.assertLess(max(abs(a - b) for a, b in zip(actual, research_golden)), 1e-6)
+
+    def test_v47_target_upgrade_preserves_top10_and_links_predecessor(self):
+        baseline = {
+            "method": "v4_6_r1_factor_selection",
+            "research_id": "v4_6_r1_0001",
+            "parameter_mode": "frozen",
+            "membership_date": "2026-07-31",
+            "decision_date": "2026-08-12",
+            "allocation_method": "equal_weight",
+            "selected": [
+                {
+                    "security_id": f"S{index}",
+                    "ticker": f"T{index}",
+                    "ff_industry_12": f"I{index}",
+                    "selection_rank": index + 1,
+                    "score": 1.0 - index * 0.05,
+                    "target_weight": 0.1,
+                }
+                for index in range(10)
+            ],
+        }
+        raw = json.dumps(baseline).encode("utf-8")
+        upgraded = build_v47_target_from_v46(baseline, predecessor_sha256=hashlib.sha256(raw).hexdigest())
+        self.assertEqual(upgraded["research_id"], "v4_7_0001")
+        self.assertEqual(upgraded["allocation_method"], "score_tilt")
+        self.assertEqual(
+            [row["ticker"] for row in upgraded["selected"]],
+            [row["ticker"] for row in baseline["selected"]],
+        )
+        self.assertEqual(
+            upgraded["predecessor_target"]["sha256"], hashlib.sha256(raw).hexdigest()
+        )
+
+    def test_default_v47_generation_builds_an_executable_v46_membership_anchor(self):
+        config = get_factor_portfolio_config(
+            {"factor_portfolio": {"mode": "v4_7_top10_score_tilt"}}
+        )
+        selected = [
+            {
+                "security_id": f"S{index}", "ticker": f"T{index}",
+                "selection_rank": index + 1, "score": 1.0 - index * 0.05,
+                "ff_industry_12": f"I{index}", "target_weight": 0.05,
+            }
+            for index in range(10)
+        ]
+        predecessor = build_v46_predecessor_payload(
+            config=config, weights=DEFAULT_WEIGHTS, membership_date="2026-07-31",
+            decision_date="2026-08-31", manifest={}, risk_audit={}, selected=selected,
+        )
+        self.assertEqual(predecessor["method"], "v4_6_r1_factor_selection")
+        self.assertEqual(predecessor["research_id"], "v4_6_r1_0001")
+        self.assertEqual({row["target_weight"] for row in predecessor["selected"]}, {0.1})
+        self.assertEqual(
+            [(row["selection_rank"], row["security_id"], row["ticker"]) for row in predecessor["selected"]],
+            [(row["selection_rank"], row["security_id"], row["ticker"]) for row in selected],
+        )
 
     def test_factor_cutoff_is_two_month_ends_behind(self):
         self.assertEqual(conservative_factor_cutoff(date(2026, 7, 31), 2), date(2026, 5, 31))

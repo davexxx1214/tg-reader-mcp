@@ -129,9 +129,9 @@ Telegram ToS: [telegram.org/tos](https://telegram.org/tos) · API ToS: [core.tel
 
 Follow [@runesgangalpha](https://t.me/runesgangalpha) — my public channel where I use this exact MCP to read and digest Polymarket, AI, and crypto signals. It's a live demo of the workflow.
 
-## Current default strategy: V4.6-R1 ten-stock factor portfolio
+## Current default strategy: V4.7 ten-stock factor portfolio
 
-The trading pipeline runs the standalone V4.6-R1 portfolio. Each month it reads an independently approved point-in-time artifact containing 10 S&P 500 stocks and targets 10% of the strategy sleeve in each name.
+The trading pipeline runs standalone V4.7. It preserves the V4.6-R1 five-factor score and Top 10, applies the frozen score-power-6 tilt, and constrains each name to 5%–20% with a 35% FF12 industry cap.
 
 The Paper account strategy budget is capped at $100,000. The executor uses only account cash plus strategy-owned long positions, never Alpaca buying power, margin, short sales, or leverage.
 Factor buys are cash-checked limit orders rather than market orders; an order is rejected instead of chasing price with borrowed funds. Sells are rechecked against the current long quantity immediately before submission.
@@ -139,7 +139,7 @@ Factor buys are cash-checked limit orders rather than market orders; an order is
 ```text
 five stock-selection scores -> rank eligible S&P 500 names
 industry cap                -> at most 3 names per FF12 industry
-final portfolio             -> 10 stocks × 10%, total weight 100%
+final portfolio             -> 10 stocks, 5%–20% each, total weight 100%
 ```
 
 TACO/nTACO is not an input, exposure overlay, or execution dependency. The old TACO sync and QQQ backtest scripts remain available only as independent legacy research tools.
@@ -149,8 +149,13 @@ TACO/nTACO is not an input, exposure overlay, or execution dependency. The old T
 ```powershell
 .\.venv\Scripts\python.exe scripts\sync_fama_french_factors.py
 .\.venv\Scripts\python.exe scripts\factor_portfolio.py
-(Get-FileHash data\factor_portfolio_latest.json -Algorithm SHA256).Hash.ToLower()
+(Get-FileHash data\factor_portfolio_v4_7_latest.json -Algorithm SHA256).Hash.ToLower()
 ```
+
+The frozen V4.7 generator also writes the equal-weight
+`factor_portfolio_v4_6_r1_YYYYMMDD.json` membership anchor and binds it into
+the V4.7 artifact by filename and SHA-256. Keep both files together for
+execution and interrupted-order reconciliation.
 
 After reviewing the target, copy its SHA-256 into `factor_execution.approved_target_sha256`. The executor refuses a missing, changed, future-dated, or stale artifact.
 
@@ -158,13 +163,13 @@ After reviewing the target, copy its SHA-256 into `factor_execution.approved_tar
 
 ```powershell
 # Dry-run with data refresh
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.7
 
 # Deterministic dry-run using existing local data
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --skip-data-sync --skip-account-refresh --execution-date 2026-08-12
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.7 --skip-data-sync --skip-account-refresh --execution-date 2026-08-12
 
 # Explicit Alpaca Paper execution with a fresh account snapshot
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --execute-trades
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.7 --execute-trades
 ```
 
 Orders remain opt-in and Paper-only by default. The pipeline preserves unmanaged holdings, journals order intents, sells strategy-owned exits first, and stops immediately when any order is not `filled`.
@@ -246,17 +251,17 @@ python scripts/query_fundamentals_sqlite.py --symbol BABA --quarters 8
 python scripts/query_prices_sqlite.py --symbols AAPL,NVDA --days 60
 ```
 
-### V4.6-R1 execution
+### V4.7 execution
 
 ```bash
 # Dry-run only (no orders)
-python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.6-r1
+python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.7
 
 # Explicit Alpaca Paper execution
-python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --execute-trades
+python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.7 --execute-trades
 ```
 
-The legacy Telegram/news configuration below is independent of the V4.6-R1 executor. `run_analysis_trade_pipeline.py` does not accept `--tg-news`, apply a market gate, or read TACO.
+The legacy Telegram/news configuration below is independent of the V4.7 executor. `run_analysis_trade_pipeline.py` does not accept `--tg-news`, apply a market gate, or read TACO.
 
 Legacy configuration retained for other repository components:
 

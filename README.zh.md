@@ -129,9 +129,9 @@ Telegram ToS：[telegram.org/tos](https://telegram.org/tos) · API ToS：[core.t
 
 [@runesgangalpha](https://t.me/runesgangalpha) — 我的公开频道，用的就是这个 MCP 在做 Polymarket / AI / Crypto 信号的读取和消化，算是这个工作流的活样本。
 
-## 当前默认策略：V4.6-R1 十股因子组合
+## 当前默认策略：V4.7 十股因子组合
 
-交易流水线运行独立的 V4.6-R1。每月读取经过独立审批的时点截面产物，从 S&P 500 中选择10只股票，每只目标权重为策略资金袖套的10%。
+交易流水线运行独立的 V4.7。它沿用 V4.6-R1 的五因子综合分和 Top 10，按综合分六次方倾斜，并把权重约束在每只5%–20%、每个 FF12 行业不超过35%。
 
 Paper 账户的策略资金上限为10万美元。执行器只使用账户现金和策略自有多头资产，不使用 Alpaca buying power，不融资、不做空、不加杠杆。
 因子买单使用提交前现金校验的限价单，不用市价买单追价；现金不足就拒绝。每笔卖单提交前也会重新核对当前多头数量，禁止超卖形成空头。
@@ -139,7 +139,7 @@ Paper 账户的策略资金上限为10万美元。执行器只使用账户现金
 ```text
 五项个股信号 -> 对合格的 S&P 500 股票排序
 行业上限     -> 每个 FF12 行业最多3只
-最终组合     -> 10只 × 10%，总权重100%
+最终组合     -> 10只，单股5%–20%，总权重100%
 ```
 
 TACO/nTACO 不是选股因子、仓位覆盖层或执行依赖。旧 TACO 同步和 QQQ 回测脚本仅作为独立历史研究工具保留。
@@ -149,8 +149,12 @@ TACO/nTACO 不是选股因子、仓位覆盖层或执行依赖。旧 TACO 同步
 ```powershell
 .\.venv\Scripts\python.exe scripts\sync_fama_french_factors.py
 .\.venv\Scripts\python.exe scripts\factor_portfolio.py
-(Get-FileHash data\factor_portfolio_latest.json -Algorithm SHA256).Hash.ToLower()
+(Get-FileHash data\factor_portfolio_v4_7_latest.json -Algorithm SHA256).Hash.ToLower()
 ```
+
+冻结的 V4.7 生成器会同时写出等权的
+`factor_portfolio_v4_6_r1_YYYYMMDD.json` 成员锚点，并把其文件名和 SHA-256
+写入 V4.7 目标。执行和中断对账期间必须将这两个文件保存在一起。
 
 人工检查篮子后，将 SHA-256 填入 `factor_execution.approved_target_sha256`。目标缺失、被修改、来自未来或过期时，执行器都会停止。
 
@@ -158,13 +162,13 @@ TACO/nTACO 不是选股因子、仓位覆盖层或执行依赖。旧 TACO 同步
 
 ```powershell
 # 默认 dry-run：同步十股价格并生成调仓计划
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.7
 
 # 使用已下载数据做确定性 dry-run
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --skip-data-sync --skip-account-refresh --execution-date 2026-08-12
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.7 --skip-data-sync --skip-account-refresh --execution-date 2026-08-12
 
 # 提交 Alpaca Paper 订单：要求新鲜账户快照
-.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --execute-trades
+.\.venv\Scripts\python.exe scripts\run_analysis_trade_pipeline.py --strategy factor-v4.7 --execute-trades
 ```
 
 订单仍然是显式开启，且默认仅限 Paper。流水线保留非本策略持仓，先写订单意图日志，策略自有卖单优先执行，任何订单未达到 `filled` 状态时立即停止。
@@ -246,17 +250,17 @@ python scripts/query_fundamentals_sqlite.py --symbol BABA --quarters 8
 python scripts/query_prices_sqlite.py --symbols AAPL,NVDA --days 60
 ```
 
-### V4.6-R1 执行
+### V4.7 执行
 
 ```bash
 # 仅 dry-run（不下单）
-python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.6-r1
+python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.7
 
 # 显式提交 Alpaca Paper 订单
-python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.6-r1 --execute-trades
+python scripts/run_analysis_trade_pipeline.py --strategy factor-v4.7 --execute-trades
 ```
 
-下面的 Telegram/新闻配置属于仓库其他旧组件，与 V4.6-R1 执行器相互独立。`run_analysis_trade_pipeline.py` 不接受 `--tg-news`，不使用 market gate，也不读取 TACO。
+下面的 Telegram/新闻配置属于仓库其他旧组件，与 V4.7 执行器相互独立。`run_analysis_trade_pipeline.py` 不接受 `--tg-news`，不使用 market gate，也不读取 TACO。
 
 保留给旧组件的 `config.yaml` 配置：
 

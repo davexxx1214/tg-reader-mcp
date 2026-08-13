@@ -42,16 +42,16 @@ ntaco_strategy:
   max_data_age_days: 7
   transaction_cost_bps: 5.0
 
-# V4.6-R1 独立十股因子篮子；始终满仓等权，不读取 TACO/nTACO
+# V4.7 独立十股因子篮子；沿用 V4.6-R1 选股并按综合分倾斜，不读取 TACO/nTACO
 factor_portfolio:
   enabled: true
-  mode: v4_6_r1_top10
+  mode: v4_7_top10_score_tilt
   parameter_mode: frozen
-  research_id: v4_6_r1_0001
+  research_id: v4_7_0001
   factor_db: "data/fama_french_daily.sqlite"
   signal_input: "data/factor_signal_input.csv"
   signal_manifest: "data/factor_signal_input.manifest.json"
-  output_path: "data/factor_portfolio_latest.json"
+  output_path: "data/factor_portfolio_v4_7_latest.json"
   holdings: 10
   max_names_per_industry: 3
   minimum_industry_count: 10
@@ -59,7 +59,11 @@ factor_portfolio:
   winsor_lower: 0.01
   winsor_upper: 0.99
   factor_lag_months: 2
-  allocation_method: equal_weight
+  allocation_method: score_tilt
+  score_power: 6
+  minimum_weight: 0.05
+  maximum_weight: 0.20
+  maximum_industry_weight: 0.35
   rebalance_frequency: monthly
   weights:
     size: 0.10
@@ -71,7 +75,7 @@ factor_portfolio:
 # 独立交易契约；每月审阅篮子后填写 approved_target_sha256 才能执行
 factor_execution:
   enabled: true
-  target_path: "data/factor_portfolio_latest.json"
+  target_path: "data/factor_portfolio_v4_7_latest.json"
   approved_target_sha256: ""
   state_path: "data/factor_execution_state.json"
   state_key_path: "data/factor_execution_state.key"

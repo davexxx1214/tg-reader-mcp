@@ -54,11 +54,35 @@ DEFAULT_NTACO_STRATEGY_CONFIG: Dict[str, Any] = {
     "max_data_age_days": 7,
     "transaction_cost_bps": 5.0,
 }
+FACTOR_STRATEGY_PROFILES: Dict[str, Dict[str, Any]] = {
+    "v4_6_r1_top10": {
+        "research_id": "v4_6_r1_0001",
+        "allocation_method": "equal_weight",
+        "score_power": 0.0,
+        "minimum_weight": 0.10,
+        "maximum_weight": 0.10,
+        "maximum_industry_weight": 0.30,
+        "target_method": "v4_6_r1_factor_selection",
+        "execution_strategy": "factor-v4.6-r1",
+        "state_strategy": "v4_6_r1_top10",
+    },
+    "v4_7_top10_score_tilt": {
+        "research_id": "v4_7_0001",
+        "allocation_method": "score_tilt",
+        "score_power": 6.0,
+        "minimum_weight": 0.05,
+        "maximum_weight": 0.20,
+        "maximum_industry_weight": 0.35,
+        "target_method": "v4_7_factor_selection_score_tilt",
+        "execution_strategy": "factor-v4.7",
+        "state_strategy": "v4_7_top10_score_tilt",
+    },
+}
 DEFAULT_FACTOR_PORTFOLIO_CONFIG: Dict[str, Any] = {
     "enabled": True,
-    "mode": "v4_6_r1_top10",
+    "mode": "v4_7_top10_score_tilt",
     "parameter_mode": "frozen",
-    "research_id": "v4_6_r1_0001",
+    "research_id": "v4_7_0001",
     "factor_db": "data/fama_french_daily.sqlite",
     "signal_input": "data/factor_signal_input.csv",
     "signal_manifest": "data/factor_signal_input.manifest.json",
@@ -70,7 +94,11 @@ DEFAULT_FACTOR_PORTFOLIO_CONFIG: Dict[str, Any] = {
     "winsor_lower": 0.01,
     "winsor_upper": 0.99,
     "factor_lag_months": 2,
-    "allocation_method": "equal_weight",
+    "allocation_method": "score_tilt",
+    "score_power": 6.0,
+    "minimum_weight": 0.05,
+    "maximum_weight": 0.20,
+    "maximum_industry_weight": 0.35,
     "rebalance_frequency": "monthly",
     "weights": {
         "size": 0.10,
@@ -265,7 +293,7 @@ def get_ntaco_strategy_config(config: Dict[str, Any] = None) -> Dict[str, Any]:
 
 
 def get_factor_portfolio_config(config: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Return validated settings for the standalone V4.6-R1 stock selector."""
+    """Return validated settings for a frozen standalone factor selector."""
     if config is None:
         config = load_config()
     raw = config.get("factor_portfolio", {}) if isinstance(config, dict) else {}
@@ -300,19 +328,18 @@ def get_factor_portfolio_config(config: Dict[str, Any] = None) -> Dict[str, Any]
     upper = as_float("winsor_upper")
     if not 0.0 <= lower < upper <= 1.0:
         raise ValueError("factor_portfolio winsor limits are invalid")
-    allocation = str(raw.get("allocation_method", "equal_weight") or "equal_weight")
-    if allocation != "equal_weight":
-        raise ValueError("factor_portfolio only supports equal_weight allocation")
     mode = str(raw.get("mode", DEFAULT_FACTOR_PORTFOLIO_CONFIG["mode"]))
-    if mode != "v4_6_r1_top10":
-        raise ValueError("factor_portfolio only supports v4_6_r1_top10 mode")
+    if mode not in FACTOR_STRATEGY_PROFILES:
+        raise ValueError("factor_portfolio mode is not a frozen supported strategy")
+    profile = FACTOR_STRATEGY_PROFILES[mode]
+    allocation = str(raw.get("allocation_method", profile["allocation_method"]) or "")
     rebalance = str(raw.get("rebalance_frequency", "monthly"))
     if rebalance != "monthly":
         raise ValueError("factor_portfolio only supports monthly rebalancing")
     parameter_mode = str(raw.get("parameter_mode", "frozen")).strip().lower()
     if parameter_mode not in {"frozen", "research"}:
         raise ValueError("factor_portfolio.parameter_mode must be frozen or research")
-    research_id = str(raw.get("research_id", DEFAULT_FACTOR_PORTFOLIO_CONFIG["research_id"])).strip()
+    research_id = str(raw.get("research_id", profile["research_id"])).strip()
     effective = {
         "enabled": _to_bool(raw.get("enabled", True), True),
         "mode": mode,
@@ -330,6 +357,15 @@ def get_factor_portfolio_config(config: Dict[str, Any] = None) -> Dict[str, Any]
         "winsor_upper": upper,
         "factor_lag_months": as_int("factor_lag_months"),
         "allocation_method": allocation,
+        "score_power": float(raw.get("score_power", profile["score_power"])),
+        "minimum_weight": float(raw.get("minimum_weight", profile["minimum_weight"])),
+        "maximum_weight": float(raw.get("maximum_weight", profile["maximum_weight"])),
+        "maximum_industry_weight": float(
+            raw.get("maximum_industry_weight", profile["maximum_industry_weight"])
+        ),
+        "target_method": profile["target_method"],
+        "execution_strategy": profile["execution_strategy"],
+        "state_strategy": profile["state_strategy"],
         "rebalance_frequency": rebalance,
         "weights": weights,
     }
@@ -339,22 +375,37 @@ def get_factor_portfolio_config(config: Dict[str, Any] = None) -> Dict[str, Any]
         or effective["minimum_industry_count"] < 1
         or effective["minimum_adv20_usd"] < 0.0
         or effective["factor_lag_months"] < 2
+        or not 0.0 < effective["minimum_weight"] <= effective["maximum_weight"] < 1.0
+        or effective["holdings"] * effective["minimum_weight"] > 1.0 + 1e-12
+        or effective["holdings"] * effective["maximum_weight"] < 1.0 - 1e-12
+        or not 0.0 < effective["maximum_industry_weight"] <= 1.0
     ):
         raise ValueError("factor_portfolio numeric limits are outside their safe range")
+    if parameter_mode == "frozen" and (
+        research_id != profile["research_id"]
+        or allocation != profile["allocation_method"]
+        or effective["score_power"] != profile["score_power"]
+        or effective["minimum_weight"] != profile["minimum_weight"]
+        or effective["maximum_weight"] != profile["maximum_weight"]
+        or effective["maximum_industry_weight"] != profile["maximum_industry_weight"]
+    ):
+        raise ValueError(f"frozen {mode} strategy identity or allocation parameters changed")
     tunable = (
         "mode", "holdings", "max_names_per_industry", "minimum_industry_count",
         "minimum_adv20_usd", "winsor_lower", "winsor_upper", "factor_lag_months",
-        "allocation_method", "rebalance_frequency", "weights",
+        "allocation_method", "score_power", "minimum_weight", "maximum_weight",
+        "maximum_industry_weight", "rebalance_frequency", "weights",
     )
+    baseline = {**DEFAULT_FACTOR_PORTFOLIO_CONFIG, **profile, "mode": mode}
     deviations = {
-        key: {"baseline": DEFAULT_FACTOR_PORTFOLIO_CONFIG[key], "effective": effective[key]}
+        key: {"baseline": baseline[key], "effective": effective[key]}
         for key in tunable
-        if effective[key] != DEFAULT_FACTOR_PORTFOLIO_CONFIG[key]
+        if effective[key] != baseline[key]
     }
     if parameter_mode == "frozen" and deviations:
-        raise ValueError(f"frozen V4.6-R1 parameters were changed: {', '.join(deviations)}")
+        raise ValueError(f"frozen {mode} parameters were changed: {', '.join(deviations)}")
     if parameter_mode == "research" and (
-        not research_id or research_id == DEFAULT_FACTOR_PORTFOLIO_CONFIG["research_id"]
+        not research_id or research_id == profile["research_id"]
     ):
         raise ValueError("research mode requires a new, non-baseline research_id")
     effective["baseline_deviations"] = deviations
