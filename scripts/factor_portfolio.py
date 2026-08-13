@@ -11,14 +11,13 @@ import argparse
 import calendar
 import csv
 import hashlib
-import itertools
 import json
 import math
 import os
 import sqlite3
 from datetime import date
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping
 
 from _config import get_factor_portfolio_config, load_config
 
@@ -236,31 +235,6 @@ def risk_factor_audit(database: Path, *, decision_date: str, lag_months: int) ->
         "actualCutoff": row[0],
         "usableRows": row[1],
     }
-
-
-def candidate_weight_grid(
-    values: Sequence[float], *, fundamental_sum: float, momentum: float
-) -> list[dict[str, float]]:
-    """Return the 19 preregistered V4.6 fundamental-weight combinations."""
-    rows: list[dict[str, float]] = []
-    for size, value, profitability, investment in itertools.product(values, repeat=4):
-        if not math.isclose(
-            size + value + profitability + investment,
-            fundamental_sum,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        ):
-            continue
-        rows.append(
-            {
-                "size": float(size),
-                "value": float(value),
-                "profitability": float(profitability),
-                "investment": float(investment),
-                "momentum": float(momentum),
-            }
-        )
-    return sorted(rows, key=lambda row: tuple(row[key] for key in FACTOR_KEYS))
 
 
 def conservative_factor_cutoff(decision_date: date, lag_months: int = 2) -> date:
@@ -645,15 +619,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="", help="Output JSON path")
     parser.add_argument("--manifest", default="", help="Signal provenance manifest JSON")
     parser.add_argument("--weights", default="", help="size=.1,value=.3,...")
-    parser.add_argument("--list-candidates", action="store_true")
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.list_candidates:
-        print(json.dumps(candidate_weight_grid([0.1, 0.2, 0.3], fundamental_sum=0.8, momentum=0.2), indent=2))
-        return
     config = get_factor_portfolio_config(load_config())
     if not config["enabled"]:
         raise FactorPortfolioError("factor portfolio must be enabled")
@@ -719,7 +689,7 @@ def main() -> None:
     effective_config = effective_factor_config(config)
     config_hash = effective_config_sha256(effective_config)
     payload = {
-        "method": config["target_method"] if config["parameter_mode"] == "frozen" else "factor_selection_research_candidate",
+        "method": config["target_method"],
         "research_id": config["research_id"],
         "parameter_mode": config["parameter_mode"],
         "membership_date": scored[0]["membership_date"],

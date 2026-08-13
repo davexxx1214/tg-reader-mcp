@@ -54,7 +54,9 @@ analysis_pipeline_latest.json
 data/taco_qqq_pipeline_latest.json
 data/factor_execution_state.key
 data/factor_execution_state.json
+data/factor_execution_state.json.lock
 data/factor_execution_journal.json
+data/factor_execution_targets/
 data/factor_alpaca_pipeline_latest.json
 data/backtests/
 

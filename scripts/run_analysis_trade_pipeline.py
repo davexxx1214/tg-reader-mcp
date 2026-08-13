@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the standalone, fully invested V4.6-R1 ten-stock basket."""
+"""Run the single frozen V4.7 ten-stock strategy on Alpaca Paper."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import json
 import math
 import os
 import secrets
-import sqlite3
 import subprocess
 import sys
 from ctypes import wintypes
@@ -29,6 +28,7 @@ except ImportError:  # pragma: no cover
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
+CASH_RESERVE_USD = 25.0
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from _config import (
@@ -44,8 +44,6 @@ from query_alpaca_account import (
     persist_account_snapshot,
 )
 from query_stock_prices import _fetch_alpaca_snapshots
-from sync_alpha_daily_to_sqlite import DEFAULT_DB_PATH as DEFAULT_PRICE_DB
-from sync_alpha_daily_to_sqlite import sync_symbols
 from factor_portfolio import (
     FactorPortfolioError,
     allocate_score_tilt,
@@ -60,10 +58,10 @@ def _load_factor_basket(
     execution_date: str,
     expected_research_id: str,
     expected_holdings: int,
-    maximum_age_days: int,
+    maximum_age_days: Optional[int],
     approved_sha256: str = "",
-    expected_method: str = "v4_6_r1_factor_selection",
-    expected_allocation_method: str = "equal_weight",
+    expected_method: str = "v4_7_factor_selection_score_tilt",
+    expected_allocation_method: str = "score_tilt",
     expected_effective_config: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Load one immutable frozen monthly ten-stock basket, failing closed."""
@@ -107,7 +105,7 @@ def _load_factor_basket(
     age_days = (execution_day - target_day).days
     if age_days < 0:
         raise RuntimeError("Factor target decision_date is in the future")
-    if age_days > maximum_age_days:
+    if maximum_age_days is not None and age_days > maximum_age_days:
         raise RuntimeError(
             f"Factor target is stale: decision_date={target_day.isoformat()} age_days={age_days}"
         )
@@ -133,9 +131,8 @@ def _load_factor_basket(
         security_ids.append(security_id)
     if len(set(tickers)) != expected_holdings or len(set(security_ids)) != expected_holdings:
         raise RuntimeError("Factor target contains duplicate tickers or security_ids")
-    if expected_allocation_method == "equal_weight":
-        target_weights = {ticker: 1.0 / expected_holdings for ticker in tickers}
-        members_match_predecessor = False
+    if expected_allocation_method != "score_tilt":
+        raise RuntimeError("V4.7 only supports the frozen score-tilt allocation")
     else:
         try:
             target_weights = {
@@ -246,7 +243,7 @@ def _build_factor_rebalance_plan(
     positions: Iterable[Mapping[str, Any]],
     prices: Mapping[str, Any],
     target_weights: Mapping[str, Any],
-    reason: str = "v4_6_r1_top10_rebalance",
+    reason: str = "v4_7_top10_score_tilt_rebalance",
 ) -> List[Dict[str, Any]]:
     """Create fractional-share orders for the isolated factor sleeve."""
     equity = float(account.get("equity") or account.get("portfolio_value") or 0.0)
@@ -290,7 +287,7 @@ def _build_factor_rebalance_plan(
         target_qty = round((equity * target_weight) / price, 6)
         delta_qty = target_qty - current_qty
         order_qty = round(abs(delta_qty), 6)
-        if order_qty <= 0.0:
+        if order_qty <= 0.0 or order_qty * price < 5.0:
             continue
         plan.append(
             {
@@ -313,19 +310,17 @@ def _strategy_sleeve(
     positions: Iterable[Mapping[str, Any]],
     owned_quantities: Mapping[str, Any],
     *,
-    initial_legacy_symbols: Iterable[str] = (),
     target_symbols: Iterable[str] = (),
     capital_allocation_usd: float,
 ) -> Dict[str, Any]:
-    """Build a fixed-capital sleeve from an authenticated ownership ledger."""
+    """Build the dedicated, cash-only V4.7 Paper account sleeve."""
     owned = {
         str(symbol).upper().strip(): float(quantity)
         for symbol, quantity in owned_quantities.items()
         if str(symbol).strip() and float(quantity) > 0.0
     }
-    legacy = set(_normalized_symbols(initial_legacy_symbols))
     targets = set(_normalized_symbols(target_symbols))
-    managed_scope = set(owned) | legacy | targets
+    managed_scope = set(owned) | targets
     filtered: List[Dict[str, Any]] = []
     managed_value = 0.0
     for source in positions:
@@ -342,12 +337,10 @@ def _strategy_sleeve(
                 or str(source.get("side", "long")).strip().lower() == "short"
             )
         ):
-            raise RuntimeError(f"V4.6-R1 does not permit a managed short position: {symbol}")
-        if symbol in targets and symbol not in owned and symbol not in legacy and broker_qty > 0.0:
-            raise RuntimeError(
-                f"Factor target collides with an unmanaged existing position: {symbol}"
-            )
-        if symbol in legacy and symbol not in owned:
+            raise RuntimeError(f"V4.7 does not permit a managed short position: {symbol}")
+        if symbol not in managed_scope and broker_qty > 0.0:
+            raise RuntimeError(f"Dedicated V4.7 account contains an unexpected position: {symbol}")
+        if symbol in targets and symbol not in owned:
             owned[symbol] = broker_qty
         if symbol not in owned:
             continue
@@ -373,13 +366,13 @@ def _strategy_sleeve(
     except (TypeError, ValueError) as exc:
         raise RuntimeError("Alpaca account has invalid cash or equity") from exc
     available = min(cash + managed_value, total_equity)
-    notional = min(float(capital_allocation_usd), available)
+    notional = min(float(capital_allocation_usd), available) - CASH_RESERVE_USD
     if notional <= 0.0 or not math.isfinite(notional):
         raise RuntimeError("Factor strategy sleeve has no investable cash or managed assets")
     return {
         "positions": filtered,
         "owned_quantities": owned,
-        "managed_symbols": sorted(set(owned) | targets | legacy),
+        "managed_symbols": sorted(set(owned) | targets),
         "cash": cash,
         "managed_market_value": managed_value,
         "notional": notional,
@@ -391,21 +384,25 @@ def validate_factor_execution(
     *, execute_trades: bool, paper_only: bool, alpaca_paper: bool
 ) -> None:
     if not paper_only:
-        raise ValueError("V4.6-R1 is an immutable Paper-only execution strategy")
+        raise ValueError("V4.7 is an immutable Paper-only execution strategy")
     if execute_trades and not alpaca_paper:
         raise ValueError("Factor execution is restricted to Alpaca Paper trading")
 
 
 def _assert_no_conflicting_open_orders(
-    open_orders: Iterable[Mapping[str, Any]], managed_symbols: Iterable[str]
+    open_orders: Iterable[Mapping[str, Any]],
+    managed_symbols: Iterable[str],
+    *,
+    allowed_client_order_ids: Iterable[str] = (),
 ) -> None:
-    """Fail closed if an in-flight broker order can alter a managed ticker."""
-    managed = set(_normalized_symbols(managed_symbols))
+    """Reject every non-journal order because V4.7 owns the dedicated account."""
+    _normalized_symbols(managed_symbols)
+    allowed = {str(value) for value in allowed_client_order_ids}
     conflicts = sorted(
         {
             str(order.get("symbol", "")).upper().strip()
             for order in open_orders
-            if str(order.get("symbol", "")).upper().strip() in managed
+            if str(order.get("client_order_id", "")) not in allowed
         }
     )
     if conflicts:
@@ -432,66 +429,27 @@ def _confirmed_owned_quantities(
     return confirmed
 
 
-def _owned_quantities_after_fills(
-    prior_owned: Mapping[str, Any],
-    trade_plan: Iterable[Mapping[str, Any]],
-    trade_results: Iterable[Mapping[str, Any]],
-    confirmed_positions: Iterable[Mapping[str, Any]],
-) -> Dict[str, float]:
-    """Advance ownership only by this journal's broker-confirmed fills."""
-    owned = {
-        str(symbol).upper().strip(): float(quantity)
-        for symbol, quantity in prior_owned.items()
-        if str(symbol).strip() and float(quantity) > 1e-9
-    }
-    plans = list(trade_plan)
-    results = list(trade_results)
-    if len(plans) != len(results):
-        raise RuntimeError("Cannot update ownership from incomplete trade results")
-    for plan, result in zip(plans, results):
-        trade = result.get("trade") if isinstance(result, Mapping) else None
-        if not isinstance(trade, Mapping) or str(trade.get("status", "")).lower() != "filled":
-            raise RuntimeError("Cannot update ownership from an unfilled order")
-        symbol = str(plan.get("symbol", "")).upper().strip()
-        try:
-            filled_qty = float(trade["filled_qty"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("Filled order result has no valid filled_qty") from exc
-        if not symbol or filled_qty <= 0.0 or not math.isfinite(filled_qty):
-            raise RuntimeError("Filled order result has invalid symbol or filled_qty")
-        if str(plan.get("action", "")).lower() == "buy":
-            owned[symbol] = owned.get(symbol, 0.0) + filled_qty
-        elif str(plan.get("action", "")).lower() == "sell":
-            remaining = owned.get(symbol, 0.0) - filled_qty
-            if remaining < -1e-6:
-                raise RuntimeError(f"Sell fill exceeds strategy-owned quantity for {symbol}")
-            if remaining > 1e-9:
-                owned[symbol] = remaining
-            else:
-                owned.pop(symbol, None)
-        else:
-            raise RuntimeError("Filled order result has invalid action")
-    broker_quantities = {
-        str(position.get("symbol", "")).upper().strip(): abs(float(position.get("qty") or 0.0))
-        for position in confirmed_positions
-        if str(position.get("symbol", "")).strip()
-    }
-    shortfalls = [
-        symbol for symbol, quantity in owned.items()
-        if broker_quantities.get(symbol, 0.0) + 1e-6 < quantity
-    ]
-    if shortfalls:
-        raise RuntimeError(
-            f"Post-trade Alpaca position is below strategy-owned quantity: {', '.join(sorted(shortfalls))}"
-        )
-    return {symbol: round(quantity, 6) for symbol, quantity in owned.items()}
-
-
 def _state_hmac(payload: Mapping[str, Any], secret: str) -> str:
     unsigned = {key: value for key, value in payload.items() if key != "state_hmac_sha256"}
     message = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
     key = hashlib.sha256(f"factor-execution-state:{secret}".encode("utf-8")).digest()
     return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def _journal_hmac(payload: Mapping[str, Any], secret: str) -> str:
+    unsigned = {key: value for key, value in payload.items() if key != "journal_hmac_sha256"}
+    message = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    key = hashlib.sha256(f"factor-execution-journal:{secret}".encode("utf-8")).digest()
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def _account_fingerprint(account_number: str, secret: str) -> str:
+    """Bind local execution state to one Alpaca account without storing its ID."""
+    number = str(account_number).strip()
+    if not number or not secret:
+        raise RuntimeError("Alpaca account fingerprint inputs are missing")
+    key = hashlib.sha256(f"factor-account:{secret}".encode("utf-8")).digest()
+    return hmac.new(key, number.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 class _DataBlob(ctypes.Structure):
@@ -560,7 +518,12 @@ def _load_or_create_state_key(path: Path) -> str:
     return key
 
 
-def _load_factor_execution_state(path: Path, *, secret: str = "") -> Dict[str, Any]:
+def _load_factor_execution_state(
+    path: Path,
+    *,
+    secret: str = "",
+    account_fingerprint: str = "",
+) -> Dict[str, Any]:
     if not path.exists():
         return {
             "owned_quantities": {},
@@ -573,8 +536,8 @@ def _load_factor_execution_state(path: Path, *, secret: str = "") -> Dict[str, A
         raise RuntimeError("Factor execution state is invalid JSON") from exc
     if (
         not isinstance(payload, dict)
-        or payload.get("schema_version") != 1
-        or payload.get("strategy") not in {"v4_6_r1_top10", "v4_7_top10_score_tilt"}
+        or payload.get("schema_version") != 2
+        or payload.get("strategy") != "v4_7_top10_score_tilt"
         or not isinstance(payload.get("owned_quantities"), dict)
     ):
         raise RuntimeError("Factor execution state contract is invalid")
@@ -582,6 +545,13 @@ def _load_factor_execution_state(path: Path, *, secret: str = "") -> Dict[str, A
         str(payload.get("state_hmac_sha256", "")), _state_hmac(payload, secret)
     ):
         raise RuntimeError("Factor execution state authentication failed")
+    stored_fingerprint = str(payload.get("account_fingerprint", ""))
+    if len(stored_fingerprint) != 64:
+        raise RuntimeError("Factor execution state account binding is invalid")
+    if account_fingerprint and not hmac.compare_digest(
+        stored_fingerprint, str(account_fingerprint)
+    ):
+        raise RuntimeError("Factor execution state belongs to a different Alpaca account")
     try:
         owned = {
             str(symbol).upper().strip(): float(quantity)
@@ -620,17 +590,7 @@ def _validate_factor_target_transition(
         basket_date == prior_date
         and str(basket.get("artifact_sha256")) != str(state.get("target_artifact_sha256"))
     ):
-        predecessor = basket.get("predecessor_target")
-        valid_upgrade = (
-            state.get("strategy") == "v4_6_r1_top10"
-            and basket.get("research_id") == "v4_7_0001"
-            and isinstance(predecessor, Mapping)
-            and predecessor.get("research_id") == "v4_6_r1_0001"
-            and predecessor.get("sha256") == state.get("target_artifact_sha256")
-            and basket.get("members_match_predecessor") is True
-        )
-        if not valid_upgrade:
-            raise RuntimeError("Factor target changed after this monthly basket was executed")
+        raise RuntimeError("Factor target changed after this monthly basket was executed")
 
 
 def _resolve_root_path(value: str) -> Path:
@@ -672,10 +632,16 @@ def validate_run_options(
 
 
 def _execute_trade_plan(
-    trade_plan: List[Dict[str, Any]], *, require_paper: bool = False
+    trade_plan: List[Dict[str, Any]],
+    *,
+    require_paper: bool = False,
+    available_cash: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     exec_script = SCRIPT_DIR / "execute_alpaca_trade.py"
     results: List[Dict[str, Any]] = []
+    remaining_cash = float(available_cash) if available_cash is not None else math.inf
+    if require_paper and (not math.isfinite(remaining_cash) or remaining_cash < 0.0):
+        raise ValueError("Paper execution requires a finite non-negative cash reservation")
     for item in trade_plan:
         action = str(item.get("action", "")).lower().strip()
         symbol = str(item.get("symbol", "")).upper().strip()
@@ -693,6 +659,8 @@ def _execute_trade_plan(
                 symbol,
                 "--qty",
                 str(qty),
+                "--wait-seconds",
+                "0",
                 "--json",
             ]
         client_order_id = str(item.get("client_order_id", "")).strip()
@@ -708,6 +676,17 @@ def _execute_trade_plan(
                         {"status": "skipped", "input": item, "reason": "invalid limit price"}
                     )
                     break
+                maximum_cost = qty * price
+                if maximum_cost > remaining_cash + 1e-6:
+                    results.append(
+                        {
+                            "status": "deferred_cash_reservation",
+                            "input": item,
+                            "remaining_cash": remaining_cash,
+                        }
+                    )
+                    continue
+                remaining_cash -= maximum_cost
                 command.extend(
                     [
                         "--order-type", "limit",
@@ -731,7 +710,7 @@ def _execute_trade_plan(
                     "stderr": completed.stderr,
                 }
             )
-            break
+            continue
         try:
             payload = json.loads(completed.stdout)
         except json.JSONDecodeError:
@@ -743,10 +722,8 @@ def _execute_trade_plan(
                     "stderr": completed.stderr,
                 }
             )
-            break
+            continue
         results.append({"status": "ok", "trade": payload})
-        if str(payload.get("status", "")).lower() != "filled":
-            break
     return results
 
 
@@ -756,9 +733,12 @@ def _prepare_execution_journal(
     *,
     target_sha256: str,
     execution_date: str,
-    strategy: str = "v4_6_r1_top10",
+    strategy: str = "v4_7_top10_score_tilt",
     target_artifact_path: Optional[Path] = None,
-    target_method: str = "v4_6_r1_factor_selection",
+    target_method: str = "v4_7_factor_selection_score_tilt",
+    account_fingerprint: str = "",
+    secret: str = "",
+    owned_quantities_before: Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Persist deterministic order intents before any broker-side mutation."""
     if path.exists():
@@ -782,65 +762,166 @@ def _prepare_execution_journal(
             separators=(",", ":"),
         )
         intent_key = hashlib.sha256(intent.encode("utf-8")).hexdigest()[:16]
-        prefix = "fv47" if strategy == "v4_7_top10_score_tilt" else "fv46"
-        order_id = f"{prefix}-{intent_key}-{index:02d}-{item['action'][0]}-{item['symbol']}"
+        order_id = f"fv47-{intent_key}-{index:02d}-{item['action'][0]}-{item['symbol']}"
         if len(order_id) > 48:
             order_id = order_id[:48]
         item["client_order_id"] = order_id
         journaled.append(item)
-    _atomic_write_json(
-        path,
-        {
-            "schema_version": 1,
-            "strategy": strategy,
-            "status": "prepared",
-            "target_sha256": target_sha256,
-            "target_artifact_filename": Path(target_artifact_path).name if target_artifact_path else "",
-            "target_method": target_method,
-            "execution_date": execution_date,
-            "orders": journaled,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
+    if len(account_fingerprint) != 64 or not secret:
+        raise RuntimeError("Execution journal requires an authenticated Alpaca account binding")
+    if target_artifact_path is None or not target_artifact_path.is_file():
+        raise RuntimeError("Execution journal requires the approved target artifact")
+    target_bytes = target_artifact_path.read_bytes()
+    if hashlib.sha256(target_bytes).hexdigest() != target_sha256:
+        raise RuntimeError("Execution journal target artifact hash does not match")
+    try:
+        target_payload = json.loads(target_bytes.decode("utf-8"))
+        predecessor_name = str(target_payload["predecessor_target"]["artifact_filename"])
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError("Execution journal target predecessor is invalid") from exc
+    if Path(predecessor_name).name != predecessor_name:
+        raise RuntimeError("Execution journal target predecessor path is unsafe")
+    predecessor_path = target_artifact_path.parent / predecessor_name
+    predecessor_bytes = predecessor_path.read_bytes()
+    archive_dir = path.parent / "factor_execution_targets" / target_sha256
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for archive_path, content in (
+        (archive_dir / "target.json", target_bytes),
+        (archive_dir / predecessor_name, predecessor_bytes),
+    ):
+        if archive_path.exists() and archive_path.read_bytes() != content:
+            raise RuntimeError("Immutable execution target archive has conflicting content")
+        temporary = archive_path.with_suffix(archive_path.suffix + ".tmp")
+        temporary.write_bytes(content)
+        temporary.replace(archive_path)
+    payload = {
+        "schema_version": 2,
+        "strategy": strategy,
+        "status": "prepared",
+        "account_fingerprint": account_fingerprint,
+        "target_sha256": target_sha256,
+        "target_archive": f"factor_execution_targets/{target_sha256}/target.json",
+        "target_method": target_method,
+        "execution_date": execution_date,
+        "owned_quantities_before": {
+            str(symbol).upper(): float(quantity)
+            for symbol, quantity in sorted((owned_quantities_before or {}).items())
+            if float(quantity) > 0.0
         },
-    )
+        "orders": journaled,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    payload["journal_hmac_sha256"] = _journal_hmac(payload, secret)
+    _atomic_write_json(path, payload)
     return journaled
 
 
-def _select_fundamentals_sync_symbols(
+def _load_execution_journal(
+    path: Path,
     *,
-    db_path: Path,
-    symbols: List[str],
-    stale_after_days: int = 7,
-    min_quarterly_rows: int = 5,
-    as_of_date: Optional[date] = None,
-) -> List[str]:
-    """Compatibility helper retained for the repository's legacy strategy tests."""
-    normalized = list(dict.fromkeys(str(symbol).upper().strip() for symbol in symbols if str(symbol).strip()))
-    if not normalized or not db_path.exists():
-        return normalized
-    today = as_of_date or datetime.now().date()
-    stale: List[str] = []
-    conn = sqlite3.connect(str(db_path))
+    secret: str,
+    account_fingerprint: str,
+    target_sha256: str = "",
+) -> Dict[str, Any]:
     try:
-        for symbol in normalized:
-            overview = conn.execute(
-                "SELECT as_of_date FROM fundamentals_overview_daily WHERE symbol = ? ORDER BY as_of_date DESC LIMIT 1",
-                (symbol,),
-            ).fetchone()
-            count = conn.execute(
-                "SELECT COUNT(*) FROM fundamentals_quarterly WHERE symbol = ?",
-                (symbol,),
-            ).fetchone()
-            try:
-                overview_date = date.fromisoformat(str(overview[0])) if overview and overview[0] else None
-            except ValueError:
-                overview_date = None
-            quarterly_count = int(count[0]) if count else 0
-            is_stale = overview_date is None or (today - overview_date).days >= max(int(stale_after_days), 0)
-            if is_stale or quarterly_count < max(int(min_quarterly_rows), 1):
-                stale.append(symbol)
-    finally:
-        conn.close()
-    return stale
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Factor execution journal is invalid JSON") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 2
+        or payload.get("strategy") != "v4_7_top10_score_tilt"
+        or payload.get("status") != "prepared"
+        or not isinstance(payload.get("orders"), list)
+        or not payload["orders"]
+    ):
+        raise RuntimeError("Factor execution journal contract is invalid")
+    if not hmac.compare_digest(
+        str(payload.get("journal_hmac_sha256", "")), _journal_hmac(payload, secret)
+    ):
+        raise RuntimeError("Factor execution journal authentication failed")
+    if not hmac.compare_digest(
+        str(payload.get("account_fingerprint", "")), str(account_fingerprint)
+    ):
+        raise RuntimeError("Factor execution journal belongs to a different Alpaca account")
+    if target_sha256 and not hmac.compare_digest(
+        str(payload.get("target_sha256", "")), str(target_sha256)
+    ):
+        raise RuntimeError("Factor execution journal targets a different portfolio")
+    journal_hash = str(payload.get("target_sha256", ""))
+    expected_archive = f"factor_execution_targets/{journal_hash}/target.json"
+    if payload.get("target_archive") != expected_archive:
+        raise RuntimeError("Factor execution journal target archive is invalid")
+    client_ids = [str(order.get("client_order_id", "")) for order in payload["orders"]]
+    if any(not value.startswith("fv47-") for value in client_ids) or len(client_ids) != len(set(client_ids)):
+        raise RuntimeError("Factor execution journal order identity is invalid")
+    return payload
+
+
+def _journal_target_path(journal_path: Path, journal: Mapping[str, Any]) -> Path:
+    target_hash = str(journal.get("target_sha256", ""))
+    if len(target_hash) != 64 or any(character not in "0123456789abcdef" for character in target_hash):
+        raise RuntimeError("Factor execution journal target hash is invalid")
+    path = journal_path.parent / "factor_execution_targets" / target_hash / "target.json"
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != target_hash:
+        raise RuntimeError("Factor execution journal target archive is missing or corrupt")
+    return path
+
+
+def _broker_value(source: Any, name: str, default: Any = None) -> Any:
+    value = source.get(name, default) if isinstance(source, Mapping) else getattr(source, name, default)
+    return value.value if hasattr(value, "value") else value
+
+
+def _inspect_execution_journal_orders(
+    client: Any, orders: Iterable[Mapping[str, Any]]
+) -> Dict[str, Any]:
+    """Classify deterministic journal legs without ever resubmitting an existing order."""
+    terminal_statuses = {"filled", "canceled", "expired", "rejected", "done_for_day"}
+    broker_orders: List[Dict[str, Any]] = []
+    missing: List[Dict[str, Any]] = []
+    inflight: List[Dict[str, Any]] = []
+    terminal: List[Dict[str, Any]] = []
+    reserved_buy_notional = 0.0
+    for intent in orders:
+        client_order_id = str(intent.get("client_order_id", ""))
+        try:
+            broker = client.get_order_by_client_id(client_order_id)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 404:
+                missing.append(dict(intent))
+                continue
+            raise
+        status = str(_broker_value(broker, "status", "")).lower()
+        row = {
+            "client_order_id": client_order_id,
+            "symbol": str(_broker_value(broker, "symbol", "")).upper(),
+            "action": str(_broker_value(broker, "side", "")).lower(),
+            "status": status,
+            "qty": float(_broker_value(broker, "qty", 0.0) or 0.0),
+            "filled_qty": float(_broker_value(broker, "filled_qty", 0.0) or 0.0),
+            "filled_avg_price": float(_broker_value(broker, "filled_avg_price", 0.0) or 0.0),
+        }
+        if row["symbol"] != str(intent.get("symbol", "")).upper() or row["action"] != str(
+            intent.get("action", "")
+        ).lower():
+            raise RuntimeError(f"Broker order identity mismatch for {client_order_id}")
+        broker_orders.append(row)
+        if status in terminal_statuses:
+            terminal.append(row)
+        else:
+            inflight.append(row)
+            if row["action"] == "buy":
+                remaining_qty = max(row["qty"] - row["filled_qty"], 0.0)
+                reserved_buy_notional += remaining_qty * float(intent.get("price") or 0.0)
+    return {
+        "broker_orders": broker_orders,
+        "missing": missing,
+        "inflight": inflight,
+        "completed": terminal,
+        "terminal": not missing and not inflight,
+        "reserved_buy_notional": reserved_buy_notional,
+    }
 
 
 def _execution_date(value: str) -> str:
@@ -854,45 +935,6 @@ def _execution_date(value: str) -> str:
 def _normalized_symbols(symbols: Iterable[str] | str) -> List[str]:
     source = [symbols] if isinstance(symbols, str) else list(symbols)
     return list(dict.fromkeys(str(symbol).upper().strip() for symbol in source if str(symbol).strip()))
-
-
-def _sync_strategy_prices(
-    *, symbols: Iterable[str], config: Mapping[str, Any], calls_per_minute: int
-) -> Dict[str, Any]:
-    api_key = str(config.get("alphavantage", {}).get("api_key", "")).strip()
-    if not api_key or api_key.startswith("your_"):
-        raise RuntimeError("alphavantage.api_key is required to sync factor-basket prices")
-    normalized = _normalized_symbols(symbols)
-    if not normalized:
-        raise RuntimeError("Factor basket has no symbols to sync")
-    inserted = sync_symbols(
-        symbols=normalized,
-        db_path=Path(DEFAULT_PRICE_DB),
-        api_key=api_key,
-        max_calls_per_minute=max(int(calls_per_minute), 1),
-        batch_size=0,
-        with_audit=False,
-        job_name="v4_6_r1_top10_pipeline",
-    )
-    return {
-        "symbols": normalized,
-        "inserted_rows": inserted,
-        "db": str(Path(DEFAULT_PRICE_DB).resolve()),
-    }
-
-
-def _latest_sqlite_price(db_path: Path, symbol: str) -> Optional[float]:
-    if not db_path.exists():
-        return None
-    conn = sqlite3.connect(str(db_path))
-    try:
-        row = conn.execute(
-            "SELECT close FROM stock_daily WHERE symbol = ? ORDER BY trade_date DESC LIMIT 1",
-            (symbol,),
-        ).fetchone()
-    finally:
-        conn.close()
-    return float(row[0]) if row and row[0] is not None else None
 
 
 def _load_prices(
@@ -910,17 +952,11 @@ def _load_prices(
                 prices[symbol] = float(snapshot[symbol]["price"])
     except Exception:
         pass
-    if require_live:
-        missing_live = [symbol for symbol in normalized if symbol not in prices]
-        if missing_live:
-            raise RuntimeError(
-                f"Live execution requires live Alpaca quotes for: {', '.join(missing_live)}"
-            )
-    for symbol in normalized:
-        if symbol not in prices:
-            cached = _latest_sqlite_price(Path(DEFAULT_PRICE_DB), symbol)
-            if cached:
-                prices[symbol] = cached
+    missing_live = [symbol for symbol in normalized if symbol not in prices]
+    if missing_live:
+        raise RuntimeError(
+            f"Alpaca quotes are required for: {', '.join(missing_live)}"
+        )
     for position in positions:
         position_symbol = str(position.get("symbol", "")).upper().strip()
         current_price = float(position.get("current_price") or 0.0)
@@ -943,7 +979,7 @@ def _load_account(*, skip_refresh: bool, execute_trades: bool) -> tuple[Dict[str
             account,
             positions,
             source="run_analysis_trade_pipeline",
-            action="pre_v4_6_r1_top10_snapshot",
+            action="pre_v4_7_top10_snapshot",
         )
         return account, positions, {"status": "fresh", "records": records}
     except Exception:
@@ -951,22 +987,6 @@ def _load_account(*, skip_refresh: bool, execute_trades: bool) -> tuple[Dict[str
             raise
         account, positions = _latest_local_account()
         return account, positions, {"status": "fallback_local"}
-
-
-def _trade_execution_succeeded(
-    trade_plan: List[Dict[str, Any]],
-    trade_results: List[Dict[str, Any]],
-) -> bool:
-    if not trade_plan:
-        return True
-    if len(trade_results) != len(trade_plan):
-        return False
-    return all(
-        isinstance(item, dict)
-        and item.get("status") == "ok"
-        and str(item.get("trade", {}).get("status", "")).lower() == "filled"
-        for item in trade_results
-    )
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -983,11 +1003,13 @@ def _write_factor_execution_state(
     target_artifact_sha256: str,
     target_decision_date: str,
     secret: str,
-    strategy: str = "v4_6_r1_top10",
+    account_fingerprint: str,
+    strategy: str = "v4_7_top10_score_tilt",
 ) -> None:
     payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "strategy": strategy,
+            "account_fingerprint": account_fingerprint,
             "owned_quantities": {
                 str(symbol).upper(): float(quantity)
                 for symbol, quantity in sorted(owned_quantities.items())
@@ -1003,19 +1025,44 @@ def _write_factor_execution_state(
 
 @contextmanager
 def _exclusive_run_lock(state_path: Path):
-    """Prevent overlapping dry/live runs from producing duplicate orders or state races."""
+    """Use an OS lock so crashes cannot leave a permanent sentinel behind."""
     state_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    handle = lock_path.open("a+b")
     try:
-        descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError as exc:
-        raise RuntimeError(f"Factor pipeline is already running; lock exists: {lock_path}") from exc
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:  # pragma: no cover - exercised on Linux/macOS deployments
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise RuntimeError(f"Factor pipeline is already running: {lock_path}") from exc
     try:
-        os.write(descriptor, str(os.getpid()).encode("ascii"))
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()).encode("ascii"))
+        handle.flush()
         yield
     finally:
-        os.close(descriptor)
-        lock_path.unlink(missing_ok=True)
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:  # pragma: no cover - exercised on Linux/macOS deployments
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1023,14 +1070,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strategy",
         required=True,
-        choices=["factor-v4.6-r1", "factor-v4.7"],
-        help="Explicitly select the ten-stock execution contract",
+        choices=["factor-v4.7"],
+        help="Run the single frozen V4.7 execution contract",
     )
     parser.add_argument("--execute-trades", action="store_true", help="Submit Alpaca Paper orders; default is dry-run")
     parser.add_argument("--skip-account-refresh", action="store_true")
-    parser.add_argument("--skip-data-sync", action="store_true", help="Use existing stock-price data")
-    parser.add_argument("--skip-price-sync", action="store_true")
-    parser.add_argument("--av-calls-per-minute", type=int, default=75)
     parser.add_argument("--execution-date", default="", help="Date for deterministic dry-run only")
     parser.add_argument(
         "--output-file",
@@ -1055,9 +1099,7 @@ def _run_pipeline(
     )
     if not selection_config["enabled"] or not execution_config["enabled"]:
         raise RuntimeError("factor selection and execution must be enabled")
-    configured_strategy = str(
-        selection_config.get("execution_strategy", "factor-v4.6-r1")
-    )
+    configured_strategy = str(selection_config.get("execution_strategy", "factor-v4.7"))
     requested_strategy = str(getattr(args, "strategy", configured_strategy))
     if requested_strategy != configured_strategy:
         raise RuntimeError("Requested strategy does not match the frozen factor config")
@@ -1075,65 +1117,149 @@ def _run_pipeline(
 
     execution_date = _execution_date(args.execution_date)
     output_path = _resolve_root_path(args.output_file)
-    basket = _load_factor_basket(
-        _resolve_root_path(execution_config["target_path"]),
-        execution_date=execution_date,
-        expected_research_id=str(selection_config["research_id"]),
-        expected_holdings=int(selection_config["holdings"]),
-        maximum_age_days=int(execution_config["maximum_target_age_days"]),
-        approved_sha256=str(execution_config["approved_target_sha256"]),
-        expected_method=str(
-            selection_config.get("target_method", "v4_6_r1_factor_selection")
-        ),
-        expected_allocation_method=str(
-            selection_config.get("allocation_method", "equal_weight")
-        ),
-        expected_effective_config=(
-            effective_factor_config(selection_config)
-            if selection_config.get("allocation_method") == "score_tilt"
-            else None
-        ),
-    )
-    state_key_path = _resolve_root_path(execution_config["state_key_path"])
-    state_secret = (
-        _load_or_create_state_key(state_key_path)
-        if state_path.exists() or args.execute_trades
-        else ""
-    )
-    execution_state = _load_factor_execution_state(state_path, secret=state_secret)
-    _validate_factor_target_transition(basket, execution_state)
-    basket_symbols = set(basket["target_weights"])
-    managed_symbols = (
-        basket_symbols
-        | set(execution_state["owned_quantities"])
-        | set(_normalized_symbols(execution_config["legacy_managed_symbols"]))
-    )
-    skip_all = bool(args.skip_data_sync)
-    sync_results: Dict[str, Any] = {}
+    configured_target_path = _resolve_root_path(execution_config["target_path"])
 
-    if skip_all or args.skip_price_sync:
-        sync_results["factor_prices"] = {"status": "skipped", "db": str(Path(DEFAULT_PRICE_DB))}
-    else:
-        sync_results["factor_prices"] = {
-            "status": "ok",
-            **_sync_strategy_prices(
-                symbols=managed_symbols,
-                config=config,
-                calls_per_minute=args.av_calls_per_minute,
+    def load_basket(
+        path: Path, approved_sha256: str, maximum_age_days: Optional[int]
+    ) -> Dict[str, Any]:
+        return _load_factor_basket(
+            path,
+            execution_date=execution_date,
+            expected_research_id=str(selection_config["research_id"]),
+            expected_holdings=int(selection_config["holdings"]),
+            maximum_age_days=maximum_age_days,
+            approved_sha256=approved_sha256,
+            expected_method=str(
+                selection_config.get("target_method", "v4_7_factor_selection_score_tilt")
             ),
-        }
+            expected_allocation_method=str(
+                selection_config.get("allocation_method", "equal_weight")
+            ),
+            expected_effective_config=(
+                effective_factor_config(selection_config)
+                if selection_config.get("allocation_method") == "score_tilt"
+                else None
+            ),
+        )
 
+    state_key_path = _resolve_root_path(execution_config["state_key_path"])
     account, positions, account_refresh = _load_account(
         skip_refresh=bool(args.skip_account_refresh),
         execute_trades=bool(args.execute_trades),
     )
     if float(account.get("equity") or account.get("portfolio_value") or 0.0) <= 0:
         raise RuntimeError("No valid Alpaca account snapshot is available")
+    state_secret = _load_or_create_state_key(state_key_path)
+    account_number = str(account.get("account_number", "")).strip()
+    if not account_number:
+        raise RuntimeError("Alpaca account snapshot has no account identity")
+    account_fingerprint = _account_fingerprint(account_number, state_secret)
+    execution_state = _load_factor_execution_state(
+        state_path,
+        secret=state_secret,
+        account_fingerprint=account_fingerprint,
+    )
+    journal_path = _resolve_root_path(execution_config["journal_path"])
+    journal_status: Dict[str, Any] = {"status": "none"}
+    if journal_path.exists():
+        journal = _load_execution_journal(
+            journal_path,
+            secret=state_secret,
+            account_fingerprint=account_fingerprint,
+        )
+        basket = load_basket(
+            _journal_target_path(journal_path, journal),
+            str(journal["target_sha256"]),
+            None,
+        )
+        basket_symbols = set(basket["target_weights"])
+        _validate_factor_target_transition(basket, execution_state)
+        order_client = get_alpaca_client()
+        if order_client is None:
+            raise RuntimeError("Alpaca client unavailable for journal reconciliation")
+        allowed_ids = [str(order["client_order_id"]) for order in journal["orders"]]
+        _assert_no_conflicting_open_orders(
+            get_open_orders(order_client),
+            basket_symbols | set(execution_state["owned_quantities"]),
+            allowed_client_order_ids=allowed_ids,
+        )
+        journal_status = _inspect_execution_journal_orders(order_client, journal["orders"])
+        journal_status["status"] = "active"
+        resumed_results: List[Dict[str, Any]] = []
+        if args.execute_trades and journal_status["missing"]:
+            resumable_cash = max(
+                float(account.get("cash") or 0.0)
+                - CASH_RESERVE_USD
+                - float(journal_status["reserved_buy_notional"]),
+                0.0,
+            )
+            resumed_results = _execute_trade_plan(
+                list(journal_status["missing"]),
+                require_paper=True,
+                available_cash=resumable_cash,
+            )
+            journal_status = _inspect_execution_journal_orders(order_client, journal["orders"])
+            journal_status["status"] = "active"
+            journal_status["resumed_results"] = resumed_results
+        if not journal_status["terminal"]:
+            output = {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "strategy": configured_strategy,
+                "mode": "live" if args.execute_trades else "dry_run",
+                "market_data_provider": "alpaca",
+                "account_refresh": account_refresh,
+                "factor_selection_config": selection_config,
+                "factor_execution_config": execution_config,
+                "factor_basket": basket,
+                "journal_status": journal_status,
+                "positions": positions,
+                "target_weights": dict(basket["target_weights"]),
+                "trade_plan": list(journal_status["missing"]),
+                "trade_results": resumed_results,
+            }
+            _atomic_write_json(output_path, output)
+            return output, output_path
+        account, positions, account_refresh = _load_account(
+            skip_refresh=False,
+            execute_trades=True,
+        )
+        refreshed_account_number = str(account.get("account_number", "")).strip()
+        if not refreshed_account_number or not hmac.compare_digest(
+            _account_fingerprint(refreshed_account_number, state_secret),
+            account_fingerprint,
+        ):
+            raise RuntimeError(
+                "Alpaca account changed while settling the execution journal"
+            )
+        confirmed = _confirmed_owned_quantities(
+            positions, basket_symbols | set(execution_state["owned_quantities"])
+        )
+        _write_factor_execution_state(
+            state_path,
+            owned_quantities=confirmed,
+            target_artifact_sha256=str(basket["artifact_sha256"]),
+            target_decision_date=str(basket["decision_date"]),
+            secret=state_secret,
+            account_fingerprint=account_fingerprint,
+        )
+        journal_path.unlink()
+        execution_state = _load_factor_execution_state(
+            state_path,
+            secret=state_secret,
+            account_fingerprint=account_fingerprint,
+        )
+        journal_status["status"] = "settled"
+    basket = load_basket(
+        configured_target_path,
+        str(execution_config["approved_target_sha256"]),
+        int(execution_config["maximum_target_age_days"]),
+    )
+    basket_symbols = set(basket["target_weights"])
+    _validate_factor_target_transition(basket, execution_state)
     sleeve = _strategy_sleeve(
         account,
         positions,
         execution_state["owned_quantities"],
-        initial_legacy_symbols=execution_config["legacy_managed_symbols"],
         target_symbols=basket_symbols,
         capital_allocation_usd=float(execution_config["capital_allocation_usd"]),
     )
@@ -1157,13 +1283,8 @@ def _run_pipeline(
         positions=sleeve["positions"],
         prices=prices,
         target_weights=target_weights,
-        reason=f"{selection_config.get('mode', 'v4_6_r1_top10')}_rebalance",
+        reason="v4_7_top10_score_tilt_rebalance",
     )
-    journal_path = _resolve_root_path(execution_config["journal_path"])
-    if journal_path.exists():
-        raise RuntimeError(
-            f"Unresolved factor execution journal exists: {journal_path}; reconcile it before retrying"
-        )
     if args.execute_trades:
         order_client = get_alpaca_client()
         if order_client is None:
@@ -1178,25 +1299,33 @@ def _run_pipeline(
             trade_plan,
             target_sha256=str(basket["artifact_sha256"]),
             execution_date=execution_date,
-            strategy=str(selection_config.get("state_strategy", "v4_6_r1_top10")),
+            strategy="v4_7_top10_score_tilt",
             target_artifact_path=_resolve_root_path(execution_config["target_path"]),
-            target_method=str(selection_config.get("target_method", "v4_6_r1_factor_selection")),
+            target_method="v4_7_factor_selection_score_tilt",
+            account_fingerprint=account_fingerprint,
+            secret=state_secret,
+            owned_quantities_before=sleeve["owned_quantities"],
         )
     trade_results = (
         _execute_trade_plan(
             trade_plan,
             require_paper=True,
+            available_cash=max(float(account.get("cash") or 0.0) - CASH_RESERVE_USD, 0.0),
         )
         if args.execute_trades
         else []
     )
-    if args.execute_trades and _trade_execution_succeeded(trade_plan, trade_results):
+    if args.execute_trades and trade_plan:
+        order_client = get_alpaca_client()
+        if order_client is None:
+            raise RuntimeError("Alpaca client unavailable after order submission")
+        journal_status = _inspect_execution_journal_orders(order_client, trade_plan)
+        journal_status["status"] = "active"
+    if args.execute_trades and trade_plan and journal_status.get("terminal"):
         _, confirmed_positions, _ = _load_account(skip_refresh=False, execute_trades=True)
-        owned_after = _owned_quantities_after_fills(
-            sleeve["owned_quantities"],
-            trade_plan,
-            trade_results,
+        owned_after = _confirmed_owned_quantities(
             confirmed_positions,
+            basket_symbols | set(sleeve["owned_quantities"]),
         )
         _write_factor_execution_state(
             state_path,
@@ -1204,31 +1333,26 @@ def _run_pipeline(
             target_artifact_sha256=str(basket["artifact_sha256"]),
             target_decision_date=str(basket["decision_date"]),
             secret=state_secret,
-            strategy=str(selection_config.get("state_strategy", "v4_6_r1_top10")),
+            account_fingerprint=account_fingerprint,
         )
         journal_path.unlink(missing_ok=True)
+        journal_status["status"] = "settled"
 
     output = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "strategy": configured_strategy,
         "mode": "live" if args.execute_trades else "dry_run",
-        "data_sync": sync_results,
+        "market_data_provider": "alpaca",
         "account_refresh": account_refresh,
         "factor_selection_config": selection_config,
         "factor_execution_config": execution_config,
         "factor_basket": basket,
         "strategy_sleeve": sleeve,
-        "preserved_unmanaged_symbols": sorted(
-            {
-                str(position.get("symbol", "")).upper().strip()
-                for position in positions
-                if str(position.get("symbol", "")).upper().strip() not in managed_symbols
-            }
-        ),
         "target_weights": target_weights,
         "prices": prices,
         "trade_plan": trade_plan,
         "trade_results": trade_results,
+        "journal_status": journal_status,
     }
     _atomic_write_json(output_path, output)
     return output, output_path

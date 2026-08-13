@@ -17,7 +17,6 @@ from factor_portfolio import (  # noqa: E402
     FactorPortfolioError,
     allocate_score_tilt,
     build_v46_predecessor_payload,
-    candidate_weight_grid,
     conservative_factor_cutoff,
     derive_raw_factors,
     score_cross_section,
@@ -25,7 +24,6 @@ from factor_portfolio import (  # noqa: E402
     validate_signal_manifest,
 )
 from sync_fama_french_factors import _write_sqlite, merge_factor_rows, parse_factor_csv  # noqa: E402
-from upgrade_v47_target import build_v47_target_from_v46  # noqa: E402
 
 
 class FactorPortfolioConfigTests(unittest.TestCase):
@@ -45,11 +43,10 @@ class FactorPortfolioConfigTests(unittest.TestCase):
         parsed = get_factor_execution_config({})
         self.assertTrue(parsed["enabled"])
         self.assertTrue(parsed["paper_only"])
-        self.assertTrue(parsed["preserve_unmanaged_positions"])
+        self.assertTrue(parsed["dedicated_account"])
         self.assertEqual(parsed["state_path"], "data/factor_execution_state.json")
         self.assertEqual(parsed["journal_path"], "data/factor_execution_journal.json")
         self.assertEqual(parsed["maximum_target_age_days"], 40)
-        self.assertEqual(parsed["legacy_managed_symbols"], [])
         self.assertEqual(parsed["capital_allocation_usd"], 100_000.0)
 
     def test_execution_rejects_capital_above_paper_account_value(self):
@@ -130,12 +127,6 @@ class FactorPortfolioScoringTests(unittest.TestCase):
                 )
         return rows
 
-    def test_candidate_grid_has_19_preregistered_weight_sets(self):
-        grid = candidate_weight_grid([0.1, 0.2, 0.3], fundamental_sum=0.8, momentum=0.2)
-        self.assertEqual(len(grid), 19)
-        self.assertIn(DEFAULT_WEIGHTS, grid)
-        self.assertTrue(all(abs(sum(row.values()) - 1.0) < 1e-12 for row in grid))
-
     def test_scores_and_selects_diversified_equal_weight_top10(self):
         scored = score_cross_section(self._rows(), DEFAULT_WEIGHTS)
         best = next(row for row in scored if row["security_id"] == "01-11")
@@ -202,38 +193,6 @@ class FactorPortfolioScoringTests(unittest.TestCase):
             0.07396741602029894,
         ]
         self.assertLess(max(abs(a - b) for a, b in zip(actual, research_golden)), 1e-6)
-
-    def test_v47_target_upgrade_preserves_top10_and_links_predecessor(self):
-        baseline = {
-            "method": "v4_6_r1_factor_selection",
-            "research_id": "v4_6_r1_0001",
-            "parameter_mode": "frozen",
-            "membership_date": "2026-07-31",
-            "decision_date": "2026-08-12",
-            "allocation_method": "equal_weight",
-            "selected": [
-                {
-                    "security_id": f"S{index}",
-                    "ticker": f"T{index}",
-                    "ff_industry_12": f"I{index}",
-                    "selection_rank": index + 1,
-                    "score": 1.0 - index * 0.05,
-                    "target_weight": 0.1,
-                }
-                for index in range(10)
-            ],
-        }
-        raw = json.dumps(baseline).encode("utf-8")
-        upgraded = build_v47_target_from_v46(baseline, predecessor_sha256=hashlib.sha256(raw).hexdigest())
-        self.assertEqual(upgraded["research_id"], "v4_7_0001")
-        self.assertEqual(upgraded["allocation_method"], "score_tilt")
-        self.assertEqual(
-            [row["ticker"] for row in upgraded["selected"]],
-            [row["ticker"] for row in baseline["selected"]],
-        )
-        self.assertEqual(
-            upgraded["predecessor_target"]["sha256"], hashlib.sha256(raw).hexdigest()
-        )
 
     def test_default_v47_generation_builds_an_executable_v46_membership_anchor(self):
         config = get_factor_portfolio_config(
