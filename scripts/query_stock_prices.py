@@ -5,12 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
-from _config import get_alpaca_credentials, load_config
+from _config import get_alpaca_credentials, get_factor_data_config, load_config
 
 
 DEFAULT_DATA_BASE_URL = "https://data.alpaca.markets"
@@ -33,12 +32,13 @@ def _fetch_alpaca_snapshots(
 ) -> Dict[str, Dict[str, Any]]:
     config = load_config()
     api_key, secret_key, _ = get_alpaca_credentials(config)
+    factor_data = get_factor_data_config(config)
     headers = {
         "APCA-API-KEY-ID": api_key,
         "APCA-API-SECRET-KEY": secret_key,
     }
-    feed = os.getenv("ALPACA_DATA_FEED", "iex").strip() or "iex"
-    base_url = os.getenv("ALPACA_DATA_BASE_URL", DEFAULT_DATA_BASE_URL).rstrip("/")
+    feed = str(factor_data["alpaca_snapshot_feed"])
+    base_url = str(factor_data.get("alpaca_data_base_url") or DEFAULT_DATA_BASE_URL).rstrip("/")
     normalized = list(dict.fromkeys(str(symbol).upper().strip() for symbol in symbols if str(symbol).strip()))
     snapshots: Dict[str, Dict[str, Any]] = {}
     for chunk in _chunks(normalized, 200):

@@ -15,7 +15,6 @@ import secrets
 import subprocess
 import sys
 from ctypes import wintypes
-from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -36,6 +35,7 @@ from _config import (
     get_factor_portfolio_config,
     load_config,
 )
+from _file_lock import exclusive_file_lock
 from query_alpaca_account import (
     get_account_info,
     get_alpaca_client,
@@ -1023,46 +1023,11 @@ def _write_factor_execution_state(
     _atomic_write_json(path, payload)
 
 
-@contextmanager
 def _exclusive_run_lock(state_path: Path):
-    """Use an OS lock so crashes cannot leave a permanent sentinel behind."""
-    state_path.parent.mkdir(parents=True, exist_ok=True)
+    """Compatibility wrapper around the repository-wide OS file lock."""
+
     lock_path = state_path.with_suffix(state_path.suffix + ".lock")
-    handle = lock_path.open("a+b")
-    try:
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b"0")
-            handle.flush()
-        handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:  # pragma: no cover - exercised on Linux/macOS deployments
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        handle.close()
-        raise RuntimeError(f"Factor pipeline is already running: {lock_path}") from exc
-    try:
-        handle.seek(0)
-        handle.truncate()
-        handle.write(str(os.getpid()).encode("ascii"))
-        handle.flush()
-        yield
-    finally:
-        handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:  # pragma: no cover - exercised on Linux/macOS deployments
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+    return exclusive_file_lock(lock_path, label="Factor pipeline")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -9,6 +9,34 @@ alpaca:
   secret_key: "your_alpaca_secret_key"
   paper: true
 
+# Live-only data builder. Historical research remains in factor-model.
+factor_data:
+  enabled: true
+  universe_mode: latest_only
+  sp500_repository: fja05680/sp500
+  sp500_branch: master
+  sp500_file: sp500.csv
+  # Fill only after reviewing the exact current CSV and its diff. Never auto-update.
+  approved_constituent_sha256: ""
+  sec_user_agent: "factor-model/1.0 research@example.com"
+  sec_requests_per_second: 5
+  alpaca_feed: sip
+  alpaca_snapshot_feed: iex
+  alpaca_adjustment: all
+  minimum_constituents: 490
+  maximum_constituents: 510
+  minimum_cik_coverage: 0.99
+  minimum_fundamental_coverage: 0.80
+  minimum_price_coverage: 0.98
+  minimum_industry_coverage: 0.95
+  minimum_complete_signal_coverage: 0.60
+  price_lookback_sessions: 756
+  minimum_risk_observations: 504
+  minimum_adv20_observations: 15
+  cache_dir: data/factor_sources
+  signal_output: data/factor_signal_input.csv
+  manifest_output: data/factor_signal_input.manifest.json
+
 # Frozen V4.7 selection contract. Do not tune these values in production.
 factor_portfolio:
   enabled: true
@@ -23,6 +51,7 @@ factor_portfolio:
   max_names_per_industry: 3
   minimum_industry_count: 10
   minimum_adv20_usd: 10000000
+  minimum_signal_rows: 450
   winsor_lower: 0.01
   winsor_upper: 0.99
   factor_lag_months: 2

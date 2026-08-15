@@ -11,7 +11,12 @@ manual positions to its Paper account.
 
 ## Frozen contract
 
-- Universe: point-in-time S&P 500 input supplied by the research workflow.
+- Universe: the current `sp500.csv` from `fja05680/sp500`, resolved from
+  `master` to an immutable commit and observed after the live month-end close.
+  Its exact CSV hash must be reviewed and explicitly approved; every ticker/CIK
+  pair is then checked against SEC submissions. If submissions omit tickers, the
+  pair must instead match `dei:TradingSymbol` in the latest causally available SEC
+  primary filing; issuer-name matching is never sufficient.
 - Holdings: 10.
 - Signal weights: Size 10%, Value 30%, Profitability 10%, Investment 30%, Momentum 20%.
 - Allocation: normalized composite score to power 6, projected to 5%-20% per stock.
@@ -28,6 +33,13 @@ V4.7 changed allocation but not the selected Top 10. It is not an executable str
 ## Dependencies
 
 - Alpaca Paper credentials: account, positions, snapshots, orders, and recovery.
+- Alpaca SIP adjusted daily bars: market-cap price, exact-session Momentum, and ADV20.
+- Alpaca IEX snapshots: execution-time estimates; the configured Paper key returns
+  HTTP 403 for real-time SIP snapshots, so do not silently switch this field.
+- SEC EDGAR: current issuer submissions, primary-filing ticker identity, accession
+  timing, XBRL fundamentals, and SIC;
+  no key, but a contact-email User-Agent is mandatory.
+- `fja05680/sp500`: current constituents and CIKs; no GitHub token required.
 - Dartmouth Fama-French Data Library: FF5 and Momentum downloads; no API key.
 - Telegram credentials: only when operating the reader MCP.
 
@@ -39,11 +51,21 @@ Keep only these top-level keys in `config.yaml`:
 
 - `telegram_api`
 - `alpaca`
+- `factor_data`
 - `factor_portfolio`
 - `factor_execution`
 
 Set `alpaca.paper: true`, `factor_execution.dedicated_account: true`, and
 `capital_allocation_usd <= 100000`. Never put manual holdings in this account.
+Keep `factor_data.universe_mode: latest_only`, historical `alpaca_feed: sip`,
+`alpaca_snapshot_feed: iex`, and the frozen
+coverage gates. This repository must not rebuild historical S&P 500 membership;
+that belongs to `D:\workspace\factor-model`.
+
+`--probe-sources` prints `constituent_sha256` and whether it matches
+`factor_data.approved_constituent_sha256`. Inspect the captured CSV and its diff
+from the previously approved list before copying that exact hash. Never let an
+agent or cron update this approval automatically.
 
 ## Monthly target workflow
 
@@ -51,10 +73,28 @@ From the repository root:
 
 ```powershell
 $PYTHON = ".\.venv\Scripts\python.exe"
+& $PYTHON scripts\build_live_factor_signals.py --probe-sources
+# inspect the current CSV/diff, then approve its exact constituent_sha256 in config.yaml
 & $PYTHON scripts\sync_fama_french_factors.py
+& $PYTHON scripts\build_live_factor_signals.py --decision-date YYYY-MM-DD
 & $PYTHON scripts\factor_portfolio.py
 (Get-FileHash data\factor_portfolio_v4_7_latest.json -Algorithm SHA256).Hash.ToLower()
 ```
+
+`build_live_factor_signals.py` must run on the actual final US market session,
+after 16:05 New York time. It refuses retroactive use of a later current list.
+It requires 490-510 constituents, distinct source snapshots, 99% CIK, 80%
+fundamental, 98% price, 95% FF12 industry, 60% complete-signal coverage, and at
+least 450 cross-sectional rows. A failure produces no target.
+
+The first valid month-end run freezes a deterministic universe capture ID. SEC
+progress is checkpointed per issuer and daily bars are frozen, so an interrupted job may be
+rerun later with the same decision date without downloading a later constituent
+list. Every source records its own retrieval time; the five final source hashes
+produce a separate bundle ID, so later SEC or adjusted-bar revisions cannot
+masquerade as the original bundle. Completed signal CSVs and manifests are retained under
+`data/factor_sources/signals/YYYY-MM-DD/` by content hash; the files under `data/`
+are only latest pointers.
 
 `factor_portfolio.py` writes both:
 

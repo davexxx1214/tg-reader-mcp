@@ -14,12 +14,15 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from zoneinfo import ZoneInfo
 
 from _config import get_factor_portfolio_config, load_config
+from _factor_artifacts import SOURCE_NAMES, factor_bundle_id
 
 
 FACTOR_KEYS = ("size", "value", "profitability", "investment", "momentum")
@@ -33,7 +36,7 @@ DEFAULT_WEIGHTS = {
 }
 EFFECTIVE_CONFIG_KEYS = (
     "holdings", "max_names_per_industry", "minimum_industry_count",
-    "minimum_adv20_usd", "winsor_lower", "winsor_upper", "factor_lag_months",
+    "minimum_adv20_usd", "minimum_signal_rows", "winsor_lower", "winsor_upper", "factor_lag_months",
     "allocation_method", "score_power", "minimum_weight", "maximum_weight",
     "maximum_industry_weight", "rebalance_frequency", "weights",
 )
@@ -116,7 +119,7 @@ REQUIRED_IDENTITY_COLUMNS = (
     "price_as_of_date",
     "industry_as_of_date",
 )
-SOURCE_SNAPSHOT_KEYS = ("constituents", "fundamentals", "prices", "industries")
+SOURCE_SNAPSHOT_KEYS = SOURCE_NAMES
 
 
 class FactorPortfolioError(ValueError):
@@ -145,16 +148,47 @@ def validate_signal_manifest(
     research_id: str,
     membership_date: str,
     decision_date: str,
+    loaded_signal_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Verify the immutable point-in-time signal snapshot and its provenance."""
     if not manifest_path.is_file():
         raise FactorPortfolioError(f"signal manifest does not exist: {manifest_path}")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest_raw = manifest_path.read_bytes()
+        manifest = json.loads(manifest_raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FactorPortfolioError("signal manifest is invalid JSON") from exc
+    manifest_hash = hashlib.sha256(manifest_raw).hexdigest()
     if not isinstance(manifest, dict) or manifest.get("version") != 1:
         raise FactorPortfolioError("signal manifest version must be 1")
+    if manifest.get("universe_mode") != "latest_only":
+        raise FactorPortfolioError("signal manifest must use the latest-only live universe")
+    try:
+        observed = datetime.fromisoformat(
+            str(manifest.get("universe_observed_at_utc", "")).replace("Z", "+00:00")
+        )
+        if observed.tzinfo is None:
+            raise ValueError
+        observed_new_york = observed.astimezone(ZoneInfo("America/New_York"))
+    except ValueError as exc:
+        raise FactorPortfolioError("signal manifest universe observation time is invalid") from exc
+    coverage = manifest.get("coverage")
+    minimum_coverage = {
+        "cik": 0.99,
+        "fundamental": 0.80,
+        "price": 0.98,
+        "industry": 0.95,
+        "complete_signal": 0.60,
+    }
+    if not isinstance(coverage, dict):
+        raise FactorPortfolioError("signal manifest coverage audit is missing")
+    for name, minimum in minimum_coverage.items():
+        try:
+            actual = float(coverage[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FactorPortfolioError(f"signal manifest {name} coverage is invalid") from exc
+        if not math.isfinite(actual) or actual < minimum or actual > 1.0:
+            raise FactorPortfolioError(f"signal manifest {name} coverage failed")
     expected = {
         "research_id": research_id,
         "membership_date": membership_date,
@@ -163,14 +197,34 @@ def validate_signal_manifest(
     for key, value in expected.items():
         if manifest.get(key) != value:
             raise FactorPortfolioError(f"signal manifest {key} does not match the cross-section")
-    actual_signal_hash = _file_sha256(signal_path)
+    decision_for_observation = _iso_date(decision_date, "decision_date")
+    if (
+        observed_new_york.date() != decision_for_observation
+        or observed_new_york.hour < 16
+        or (observed_new_york.hour == 16 and observed_new_york.minute < 5)
+    ):
+        raise FactorPortfolioError("signal manifest was not observed after the live decision close")
+    actual_signal_hash = loaded_signal_sha256 or _file_sha256(signal_path)
+    if loaded_signal_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", loaded_signal_sha256):
+        raise FactorPortfolioError("loaded signal CSV hash is invalid")
     if manifest.get("signal_sha256") != actual_signal_hash:
-        raise FactorPortfolioError("signal CSV hash does not match its manifest")
+        raise FactorPortfolioError("loaded signal CSV hash does not match its manifest")
+    immutable_signal_path = Path(str(manifest.get("signal_path") or ""))
+    if not immutable_signal_path.is_absolute():
+        immutable_signal_path = manifest_path.parent / immutable_signal_path
+    if (
+        not immutable_signal_path.is_file()
+        or _file_sha256(immutable_signal_path) != actual_signal_hash
+    ):
+        raise FactorPortfolioError("immutable signal artifact is missing or changed")
     decision = _iso_date(decision_date, "decision_date")
     snapshots = manifest.get("source_snapshots")
     if not isinstance(snapshots, dict) or set(snapshots) != set(SOURCE_SNAPSHOT_KEYS):
-        raise FactorPortfolioError("signal manifest must identify all four source snapshots")
+        raise FactorPortfolioError("signal manifest must identify all five source snapshots")
     normalized: dict[str, dict[str, str]] = {}
+    resolved_paths: set[Path] = set()
+    source_hashes: dict[str, str] = {}
+    retrieval_times: list[datetime] = []
     for name in SOURCE_SNAPSHOT_KEYS:
         source = snapshots[name]
         if not isinstance(source, dict):
@@ -178,6 +232,14 @@ def validate_signal_manifest(
         available = _iso_date(source.get("available_through"), f"{name}.available_through")
         source_hash = str(source.get("sha256", "")).lower()
         source_path_value = str(source.get("path", "")).strip()
+        try:
+            retrieved = datetime.fromisoformat(
+                str(source.get("retrieved_at_utc", "")).replace("Z", "+00:00")
+            )
+            if retrieved.tzinfo is None:
+                raise ValueError
+        except ValueError as exc:
+            raise FactorPortfolioError(f"source snapshot {name} retrieval time is invalid") from exc
         source_path = Path(source_path_value)
         if not source_path.is_absolute():
             source_path = manifest_path.parent / source_path
@@ -187,18 +249,102 @@ def validate_signal_manifest(
             raise FactorPortfolioError(f"source snapshot {name} has an invalid SHA-256")
         if not source_path_value or not source_path.is_file():
             raise FactorPortfolioError(f"source snapshot {name} artifact does not exist")
+        resolved = source_path.resolve()
+        if resolved in resolved_paths:
+            raise FactorPortfolioError("source snapshots must be distinct artifacts")
+        resolved_paths.add(resolved)
         if _file_sha256(source_path) != source_hash:
             raise FactorPortfolioError(f"source snapshot {name} artifact hash does not match")
         normalized[name] = {
             "path": str(source_path),
             "availableThrough": available.isoformat(),
             "sha256": source_hash,
+            "retrievedAtUtc": retrieved.isoformat(),
         }
+        source_hashes[name] = source_hash
+        retrieval_times.append(retrieved)
+    try:
+        expected_bundle = factor_bundle_id(decision_date, source_hashes)
+    except ValueError as exc:
+        raise FactorPortfolioError("signal source bundle is invalid") from exc
+    if manifest.get("bundle_id") != expected_bundle:
+        raise FactorPortfolioError("signal manifest bundle ID does not match its sources")
+    expected_capture = f"{decision_for_observation:%Y%m%d}_{source_hashes['constituents'][:16]}"
+    if manifest.get("universe_capture_id") != expected_capture:
+        raise FactorPortfolioError("signal manifest universe capture ID is invalid")
+    try:
+        built_at = datetime.fromisoformat(
+            str(manifest.get("built_at_utc", "")).replace("Z", "+00:00")
+        )
+        if built_at.tzinfo is None:
+            raise ValueError
+    except ValueError as exc:
+        raise FactorPortfolioError("signal manifest build time is invalid") from exc
+    if built_at != max(retrieval_times):
+        raise FactorPortfolioError("signal manifest build time does not match source retrievals")
+    factor_path = Path(normalized["fama_french"]["path"])
+    try:
+        factor_snapshot = json.loads(factor_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FactorPortfolioError("Fama-French source snapshot is invalid") from exc
+    if (
+        not isinstance(factor_snapshot, dict)
+        or factor_snapshot.get("version") != 1
+        or factor_snapshot.get("decision_date") != decision_date
+        or not str(factor_snapshot.get("vintage_id") or "")
+        or not isinstance(factor_snapshot.get("rows"), list)
+    ):
+        raise FactorPortfolioError("Fama-French source snapshot contract is invalid")
+    immutable_dir = Path(str(manifest.get("immutable_artifact_dir") or ""))
+    if not immutable_dir.is_absolute():
+        immutable_dir = manifest_path.parent / immutable_dir
+    immutable_manifest = immutable_dir / f"manifest_{manifest_hash}.json"
+    if (
+        not immutable_manifest.is_file()
+        or immutable_manifest.read_bytes() != manifest_raw
+    ):
+        raise FactorPortfolioError("immutable signal manifest is missing or changed")
     return {
-        "path": str(manifest_path),
-        "manifestSha256": _file_sha256(manifest_path),
+        "path": str(immutable_manifest),
+        "manifestSha256": manifest_hash,
         "signalSha256": actual_signal_hash,
         "sourceSnapshots": normalized,
+        "factorVintageId": factor_snapshot["vintage_id"],
+    }
+
+
+def risk_factor_snapshot_audit(
+    snapshot_path: Path, *, decision_date: str, lag_months: int
+) -> dict[str, Any]:
+    """Audit the exact immutable FF vintage already bound into the signal bundle."""
+
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FactorPortfolioError("Fama-French source snapshot is invalid") from exc
+    cutoff = conservative_factor_cutoff(_iso_date(decision_date, "decision_date"), lag_months)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != 1
+        or payload.get("decision_date") != decision_date
+        or not isinstance(payload.get("rows"), list)
+    ):
+        raise FactorPortfolioError("Fama-French source snapshot contract is invalid")
+    usable = [
+        str(row.get("trade_date") or "")
+        for row in payload["rows"]
+        if str(row.get("trade_date") or "") <= cutoff.isoformat()
+    ]
+    if not usable:
+        raise FactorPortfolioError("Fama-French snapshot has no causally usable observations")
+    return {
+        "snapshot": str(snapshot_path),
+        "snapshotSha256": _file_sha256(snapshot_path),
+        "vintageId": payload.get("vintage_id"),
+        "vintageFetchedAtUtc": payload.get("vintage_fetched_at_utc"),
+        "contractualCutoff": cutoff.isoformat(),
+        "actualCutoff": max(usable),
+        "usableRows": len(usable),
     }
 
 
@@ -357,6 +503,7 @@ def score_cross_section(
     *,
     industry_min_count: int = 10,
     winsor_limits: tuple[float, float] = (0.01, 0.99),
+    minimum_rows: int = 1,
 ) -> list[dict[str, Any]]:
     """Calculate point-in-time percentiles and the frozen weighted score."""
     parsed_weights = _validated_weights(weights)
@@ -398,6 +545,10 @@ def score_cross_section(
 
     if not result:
         raise FactorPortfolioError("signal input is empty")
+    if minimum_rows < 1 or len(result) < minimum_rows:
+        raise FactorPortfolioError(
+            f"signal cross-section has {len(result)} rows; minimum is {minimum_rows}"
+        )
     if len({row["membership_date"] for row in result}) != 1 or len(
         {row["decision_date"] for row in result}
     ) != 1:
@@ -606,6 +757,19 @@ def load_signal_csv(path: Path) -> list[dict[str, Any]]:
         return list(csv.DictReader(handle))
 
 
+def load_signal_snapshot(path: Path) -> tuple[list[dict[str, Any]], str]:
+    """Read and hash one immutable view so a concurrent publish cannot mix versions."""
+
+    if not path.is_file():
+        raise FactorPortfolioError(f"signal input does not exist: {path}")
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise FactorPortfolioError("signal input is not UTF-8") from exc
+    return list(csv.DictReader(text.splitlines())), hashlib.sha256(raw).hexdigest()
+
+
 def _parse_weights(value: str) -> dict[str, float]:
     if not value:
         return dict(DEFAULT_WEIGHTS)
@@ -624,7 +788,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    config = get_factor_portfolio_config(load_config())
+    loaded = load_config()
+    config = get_factor_portfolio_config(loaded)
     if not config["enabled"]:
         raise FactorPortfolioError("factor portfolio must be enabled")
     input_path = Path(args.input or config["signal_input"])
@@ -632,11 +797,13 @@ def main() -> None:
     weights = _parse_weights(args.weights) if args.weights else config["weights"]
     if args.weights and config["parameter_mode"] == "frozen":
         raise FactorPortfolioError("--weights is forbidden in frozen mode")
+    signal_rows, loaded_signal_sha256 = load_signal_snapshot(input_path)
     scored = score_cross_section(
-        load_signal_csv(input_path),
+        signal_rows,
         weights,
         industry_min_count=config["minimum_industry_count"],
         winsor_limits=(config["winsor_lower"], config["winsor_upper"]),
+        minimum_rows=config["minimum_signal_rows"],
     )
     manifest = validate_signal_manifest(
         Path(args.manifest or config["signal_manifest"]),
@@ -644,9 +811,10 @@ def main() -> None:
         research_id=config["research_id"],
         membership_date=scored[0]["membership_date"],
         decision_date=scored[0]["decision_date"],
+        loaded_signal_sha256=loaded_signal_sha256,
     )
-    risk_audit = risk_factor_audit(
-        Path(config["factor_db"]),
+    risk_audit = risk_factor_snapshot_audit(
+        Path(manifest["sourceSnapshots"]["fama_french"]["path"]),
         decision_date=scored[0]["decision_date"],
         lag_months=config["factor_lag_months"],
     )

@@ -12,6 +12,7 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from _config import get_factor_execution_config, get_factor_portfolio_config  # noqa: E402
+from _factor_artifacts import factor_bundle_id  # noqa: E402
 from factor_portfolio import (  # noqa: E402
     DEFAULT_WEIGHTS,
     FactorPortfolioError,
@@ -33,6 +34,7 @@ class FactorPortfolioConfigTests(unittest.TestCase):
         self.assertEqual(parsed["weights"], DEFAULT_WEIGHTS)
         self.assertEqual(parsed["holdings"], 10)
         self.assertEqual(parsed["max_names_per_industry"], 3)
+        self.assertEqual(parsed["minimum_signal_rows"], 450)
         self.assertEqual(parsed["factor_lag_months"], 2)
         self.assertEqual(parsed["allocation_method"], "score_tilt")
         self.assertEqual(parsed["mode"], "v4_7_top10_score_tilt")
@@ -112,6 +114,7 @@ class FactorPortfolioScoringTests(unittest.TestCase):
                         "ff_industry_12": str(industry),
                         "membership_date": "2026-07-31",
                         "decision_date": "2026-07-31",
+                        "observed_at_utc": "2026-07-31T20:10:00+00:00",
                         "constituent_as_of_date": "2026-07-31",
                         "fundamental_available_date": "2026-07-30",
                         "price_as_of_date": "2026-07-31",
@@ -264,28 +267,58 @@ class FactorPortfolioScoringTests(unittest.TestCase):
             signal_path.write_text("security_id\nA\n", encoding="utf-8")
             signal_hash = hashlib.sha256(signal_path.read_bytes()).hexdigest()
             sources = {}
-            for name in ("constituents", "fundamentals", "prices", "industries"):
+            for name in ("constituents", "fundamentals", "prices", "industries", "fama_french"):
                 source_path = root / f"{name}.snapshot"
-                source_path.write_text(name, encoding="utf-8")
+                if name == "fama_french":
+                    source_path.write_text(
+                        json.dumps(
+                            {
+                                "version": 1,
+                                "decision_date": "2026-07-31",
+                                "vintage_id": "vintage-test",
+                                "rows": [{"trade_date": "2026-05-29"}],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                else:
+                    source_path.write_text(name, encoding="utf-8")
                 sources[name] = {
                     "path": source_path.name,
                     "available_through": "2026-07-31",
                     "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                    "retrieved_at_utc": "2026-07-31T20:10:00+00:00",
                 }
+            source_hashes = {name: row["sha256"] for name, row in sources.items()}
             manifest_path = root / "signals.manifest.json"
-            manifest_path.write_text(
-                json.dumps(
-                    {
+            immutable_dir = root / "immutable"
+            immutable_dir.mkdir()
+            manifest_payload = {
                         "version": 1,
+                        "universe_mode": "latest_only",
                         "research_id": "v4_6_r1_0001",
                         "membership_date": "2026-07-31",
                         "decision_date": "2026-07-31",
+                        "universe_observed_at_utc": "2026-07-31T20:10:00+00:00",
+                        "built_at_utc": "2026-07-31T20:10:00+00:00",
+                        "universe_capture_id": "20260731_" + source_hashes["constituents"][:16],
+                        "bundle_id": factor_bundle_id("2026-07-31", source_hashes),
                         "signal_sha256": signal_hash,
+                        "signal_path": str(signal_path),
+                        "immutable_artifact_dir": str(immutable_dir),
+                        "coverage": {
+                            "cik": 1.0,
+                            "fundamental": 0.99,
+                            "price": 1.0,
+                            "industry": 0.99,
+                            "complete_signal": 0.62,
+                        },
                         "source_snapshots": sources,
                     }
-                ),
-                encoding="utf-8",
-            )
+            manifest_raw = json.dumps(manifest_payload).encode("utf-8")
+            manifest_path.write_bytes(manifest_raw)
+            manifest_hash = hashlib.sha256(manifest_raw).hexdigest()
+            (immutable_dir / f"manifest_{manifest_hash}.json").write_bytes(manifest_raw)
             verified = validate_signal_manifest(
                 manifest_path,
                 signal_path,
@@ -294,6 +327,59 @@ class FactorPortfolioScoringTests(unittest.TestCase):
                 decision_date="2026-07-31",
             )
             self.assertEqual(verified["signalSha256"], signal_hash)
+
+            with self.assertRaisesRegex(FactorPortfolioError, "loaded signal CSV hash"):
+                validate_signal_manifest(
+                    manifest_path,
+                    signal_path,
+                    research_id="v4_6_r1_0001",
+                    membership_date="2026-07-31",
+                    decision_date="2026-07-31",
+                    loaded_signal_sha256="0" * 64,
+                )
+
+    def test_signal_manifest_rejects_one_file_masquerading_as_all_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            signal_path = root / "signals.csv"
+            signal_path.write_text("security_id\nA\n", encoding="utf-8")
+            source_path = root / "one.snapshot"
+            source_path.write_text("one", encoding="utf-8")
+            source = {
+                "path": source_path.name,
+                "available_through": "2026-07-31",
+                "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                "retrieved_at_utc": "2026-07-31T20:10:00+00:00",
+            }
+            manifest_path = root / "signals.manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "universe_mode": "latest_only",
+                        "research_id": "v4_7_0001",
+                        "membership_date": "2026-07-31",
+                        "decision_date": "2026-07-31",
+                        "universe_observed_at_utc": "2026-07-31T20:10:00+00:00",
+                        "signal_sha256": hashlib.sha256(signal_path.read_bytes()).hexdigest(),
+                        "signal_path": str(signal_path),
+                        "coverage": {
+                            "cik": 1.0, "fundamental": 0.99, "price": 1.0,
+                            "industry": 0.99, "complete_signal": 0.62,
+                        },
+                        "source_snapshots": {
+                            name: dict(source)
+                            for name in ("constituents", "fundamentals", "prices", "industries", "fama_french")
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(FactorPortfolioError, "distinct"):
+                validate_signal_manifest(
+                    manifest_path, signal_path, research_id="v4_7_0001",
+                    membership_date="2026-07-31", decision_date="2026-07-31",
+                )
 
 
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
@@ -34,6 +36,7 @@ DEFAULT_FACTOR_PORTFOLIO_CONFIG: Dict[str, Any] = {
     "max_names_per_industry": 3,
     "minimum_industry_count": 10,
     "minimum_adv20_usd": 10_000_000.0,
+    "minimum_signal_rows": 450,
     "winsor_lower": 0.01,
     "winsor_upper": 0.99,
     "factor_lag_months": 2,
@@ -57,6 +60,38 @@ DEFAULT_FACTOR_EXECUTION_CONFIG: Dict[str, Any] = {
     "paper_only": True,
     "dedicated_account": True,
     "capital_allocation_usd": 100_000.0,
+}
+
+DEFAULT_FACTOR_DATA_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "universe_mode": "latest_only",
+    "sp500_repository": "fja05680/sp500",
+    "sp500_branch": "master",
+    "sp500_file": "sp500.csv",
+    "approved_constituent_sha256": "",
+    "github_api_base_url": "https://api.github.com",
+    "github_raw_base_url": "https://raw.githubusercontent.com",
+    "sec_data_base_url": "https://data.sec.gov",
+    "sec_archives_base_url": "https://www.sec.gov/Archives",
+    "sec_user_agent": "",
+    "sec_requests_per_second": 5.0,
+    "alpaca_data_base_url": "https://data.alpaca.markets",
+    "alpaca_feed": "sip",
+    "alpaca_snapshot_feed": "iex",
+    "alpaca_adjustment": "all",
+    "minimum_constituents": 490,
+    "maximum_constituents": 510,
+    "minimum_cik_coverage": 0.99,
+    "minimum_fundamental_coverage": 0.80,
+    "minimum_price_coverage": 0.98,
+    "minimum_industry_coverage": 0.95,
+    "minimum_complete_signal_coverage": 0.60,
+    "price_lookback_sessions": 756,
+    "minimum_risk_observations": 504,
+    "minimum_adv20_observations": 15,
+    "cache_dir": "data/factor_sources",
+    "signal_output": "data/factor_signal_input.csv",
+    "manifest_output": "data/factor_signal_input.manifest.json",
 }
 
 
@@ -109,6 +144,7 @@ def get_factor_portfolio_config(config: Dict[str, Any] | None = None) -> Dict[st
         "max_names_per_industry": int(effective["max_names_per_industry"]),
         "minimum_industry_count": int(effective["minimum_industry_count"]),
         "minimum_adv20_usd": float(effective["minimum_adv20_usd"]),
+        "minimum_signal_rows": int(effective["minimum_signal_rows"]),
         "winsor_lower": float(effective["winsor_lower"]),
         "winsor_upper": float(effective["winsor_upper"]),
         "factor_lag_months": int(effective["factor_lag_months"]),
@@ -121,7 +157,8 @@ def get_factor_portfolio_config(config: Dict[str, Any] | None = None) -> Dict[st
     frozen = DEFAULT_FACTOR_PORTFOLIO_CONFIG
     frozen_keys = (
         "mode", "parameter_mode", "research_id", "holdings", "max_names_per_industry",
-        "minimum_industry_count", "minimum_adv20_usd", "winsor_lower", "winsor_upper",
+        "minimum_industry_count", "minimum_adv20_usd", "minimum_signal_rows",
+        "winsor_lower", "winsor_upper",
         "factor_lag_months", "allocation_method", "score_power", "minimum_weight",
         "maximum_weight", "maximum_industry_weight", "rebalance_frequency", "weights",
     )
@@ -168,3 +205,67 @@ def get_factor_execution_config(config: Dict[str, Any] | None = None) -> Dict[st
     if result["maximum_target_age_days"] < 1 or not 0 < result["capital_allocation_usd"] <= MAX_FACTOR_CAPITAL_USD:
         raise ValueError("factor_execution limits must be positive and capital cannot exceed 100000")
     return result
+
+
+def get_factor_data_config(config: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Return the live-only data contract used to build the current V4.7 cross-section."""
+
+    payload = config if config is not None else load_config()
+    raw = payload.get("factor_data", {}) if isinstance(payload, Mapping) else {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("factor_data must be a mapping")
+    effective = {**DEFAULT_FACTOR_DATA_CONFIG, **dict(raw)}
+    if not str(effective.get("sec_user_agent", "")).strip():
+        effective["sec_user_agent"] = os.environ.get("SEC_USER_AGENT", "").strip()
+    user_agent = str(effective["sec_user_agent"]).strip()
+    if not re.search(r"[^\s@]+@[^\s@]+\.[^\s@]+", user_agent):
+        raise ValueError("factor_data.sec_user_agent must include a contact email")
+    approved_constituents = str(effective.get("approved_constituent_sha256", "")).lower().strip()
+    if approved_constituents and not re.fullmatch(r"[0-9a-f]{64}", approved_constituents):
+        raise ValueError("factor_data.approved_constituent_sha256 must be a SHA-256")
+
+    frozen = DEFAULT_FACTOR_DATA_CONFIG
+    frozen_keys = (
+        "universe_mode", "sp500_repository", "sp500_branch", "sp500_file",
+        "github_api_base_url", "github_raw_base_url", "sec_data_base_url",
+        "sec_archives_base_url", "alpaca_data_base_url",
+        "alpaca_feed", "alpaca_snapshot_feed", "alpaca_adjustment", "minimum_constituents",
+        "maximum_constituents", "price_lookback_sessions",
+        "minimum_risk_observations", "minimum_adv20_observations",
+        "minimum_cik_coverage", "minimum_fundamental_coverage",
+        "minimum_price_coverage", "minimum_industry_coverage",
+        "minimum_complete_signal_coverage",
+    )
+    changed = [key for key in frozen_keys if effective[key] != frozen[key]]
+    if changed:
+        raise ValueError(f"Frozen live factor-data parameters changed: {', '.join(changed)}")
+
+    numeric = {
+        "sec_requests_per_second": float(effective["sec_requests_per_second"]),
+        "minimum_constituents": int(effective["minimum_constituents"]),
+        "maximum_constituents": int(effective["maximum_constituents"]),
+        "minimum_cik_coverage": float(effective["minimum_cik_coverage"]),
+        "minimum_fundamental_coverage": float(effective["minimum_fundamental_coverage"]),
+        "minimum_price_coverage": float(effective["minimum_price_coverage"]),
+        "minimum_industry_coverage": float(effective["minimum_industry_coverage"]),
+        "minimum_complete_signal_coverage": float(effective["minimum_complete_signal_coverage"]),
+        "price_lookback_sessions": int(effective["price_lookback_sessions"]),
+        "minimum_risk_observations": int(effective["minimum_risk_observations"]),
+        "minimum_adv20_observations": int(effective["minimum_adv20_observations"]),
+    }
+    effective.update(numeric)
+    if not 0 < effective["sec_requests_per_second"] <= 10:
+        raise ValueError("SEC request rate must be between 0 and 10 per second")
+    if effective["minimum_constituents"] > effective["maximum_constituents"]:
+        raise ValueError("factor-data constituent bounds are invalid")
+    for key in (
+        "minimum_cik_coverage", "minimum_fundamental_coverage",
+        "minimum_price_coverage", "minimum_industry_coverage",
+        "minimum_complete_signal_coverage",
+    ):
+        if not 0 < effective[key] <= 1:
+            raise ValueError(f"factor_data.{key} must be in (0, 1]")
+    effective["enabled"] = _to_bool(effective.get("enabled", True), True)
+    effective["sec_user_agent"] = user_agent
+    effective["approved_constituent_sha256"] = approved_constituents
+    return effective

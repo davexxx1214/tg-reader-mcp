@@ -13,6 +13,9 @@ Copy-Item config.example.yaml config.yaml
 
 使用 Telegram MCP 时填写 Telegram 凭证；运行 V4.7 时填写 Alpaca Paper 凭证。
 不再需要 Alpha Vantage 或其他行情、新闻 API。
+SEC EDGAR 不需要 API key，但 `factor_data.sec_user_agent` 必须包含真实联系邮箱；
+Alpaca 账户必须具备 SIP 历史行情权限；该 Paper key 没有 SIP 实时权限，因此下单前
+snapshot 明确使用 IEX。
 
 ```powershell
 python login.py
@@ -27,12 +30,28 @@ V4.7 使用 Size 10%、Value 30%、Profitability 10%、Investment 30%、Momentum
 
 ```powershell
 $PYTHON = ".\.venv\Scripts\python.exe"
+# 只读检查数据源，不生成目标、不下单
+& $PYTHON scripts\build_live_factor_signals.py --probe-sources
+# 检查当前成分 CSV 及与上次名单的差异，再把精确 constituent_sha256 写入 config.yaml
+
+# 只能在当月最后一个美股交易日、纽约时间 16:05 后运行
 & $PYTHON scripts\sync_fama_french_factors.py
+& $PYTHON scripts\build_live_factor_signals.py --decision-date YYYY-MM-DD
 & $PYTHON scripts\factor_portfolio.py
 (Get-FileHash data\factor_portfolio_v4_7_latest.json -Algorithm SHA256).Hash.ToLower()
 ```
 
 人工检查目标后，把哈希手动写入 `factor_execution.approved_target_sha256`。
+
+执行仓库只读取 `fja05680/sp500` 的最新 `sp500.csv`。程序先把 `master`
+解析成不可变 commit，再冻结原始成分文件、更新当前 SEC 财报并下载 Alpaca SIP
+调整后日线。这里不重建历史成分；历史成分研究和回测继续保留在
+`D:\workspace\factor-model`。
+
+第三方名单不会直接进入交易：成分文件的精确 SHA-256 必须人工批准，且每个
+ticker/CIK 都会再用 SEC submissions 核对。月末任务中断后可凭同一成分 capture ID、
+逐发行人 checkpoint 和冻结日线续跑；五类来源分别记录下载时间，最终哈希组成独立
+bundle ID，完整信号与 manifest 按日期和内容哈希归档。
 
 ```powershell
 # 不下单

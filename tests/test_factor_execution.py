@@ -39,6 +39,7 @@ V47_EFFECTIVE_CONFIG = {
     "max_names_per_industry": 3,
     "minimum_industry_count": 10,
     "minimum_adv20_usd": 10_000_000.0,
+    "minimum_signal_rows": 450,
     "winsor_lower": 0.01,
     "winsor_upper": 0.99,
     "factor_lag_months": 2,

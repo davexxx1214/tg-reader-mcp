@@ -58,6 +58,9 @@ data/factor_execution_state.json.lock
 data/factor_execution_journal.json
 data/factor_execution_targets/
 data/factor_alpaca_pipeline_latest.json
+data/factor_sources/
+data/factor_signal_input.csv
+data/factor_signal_input.manifest.json
 data/backtests/
 
 # SQLite databases (runtime generated)
